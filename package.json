@@ -1,14 +1,33 @@
 {
-  "name": "luke-workspace",
-  "private": true,
-  "scripts": {
-    "format": "biome format --write .",
-    "lint": "biome lint .",
-    "check": "biome check --apply .",
-    "test:core": "cd core && zig build test"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "2.5.8",
-    "lefthook": "^2.1.10"
-  }
+	"name": "luke-workspace",
+	"private": true,
+	"keywords": [
+		"pi-package",
+		"pi",
+		"skills"
+	],
+	"bin": {
+		"luke": "./bin/luke"
+	},
+	"pi": {
+		"extensions": [
+			"./pi-extension/index.js"
+		],
+		"skills": [
+			"./skills"
+		]
+	},
+	"scripts": {
+		"format": "biome format --write .",
+		"lint": "biome lint .",
+		"check": "biome check --apply .",
+		"test:core": "cd core && zig build test"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.8",
+		"lefthook": "^2.1.10"
+	},
+	"peerDependencies": {
+		"typebox": "*"
+	}
 }
