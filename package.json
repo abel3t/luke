@@ -4,7 +4,8 @@
   "scripts": {
     "format": "biome format --write .",
     "lint": "biome lint .",
-    "check": "biome check --apply ."
+    "check": "biome check --apply .",
+    "test:core": "cd core && zig build test"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",

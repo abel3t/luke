@@ -19,6 +19,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     defer reg.deinit();
 
     const slug_opt = reg.detect(cwd);
+    var active_slug = slug_opt;
 
     // Collect diff output from all repos
     var diff_output_list = std.ArrayList(u8).empty;
@@ -40,38 +41,40 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
         const ws_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces/{s}", .{ home_dir, slug });
         defer allocator.free(ws_dir);
 
-        var ws = workspace_mod.Workspace.load(allocator, io, ws_dir) catch {
+        if (workspace_mod.Workspace.load(allocator, io, ws_dir)) |loaded_ws| {
+            var ws = loaded_ws;
+            defer ws.deinit();
+
+            try err.interface.print("Workspace: {s} — running review across {d} repos...\n", .{ ws.name, ws.folders.items.len });
+            try err.flush();
+
+            for (ws.folders.items) |folder| {
+                var diff_cmd = std.ArrayList([]const u8).empty;
+                defer diff_cmd.deinit(allocator);
+
+                try diff_cmd.appendSlice(allocator, &[_][]const u8{ "git", "-C", folder.path, "diff" });
+                if (args.len > 2) {
+                    try diff_cmd.appendSlice(allocator, args[2..]);
+                } else {
+                    try diff_cmd.append(allocator, "HEAD");
+                }
+
+                const result = std.process.run(allocator, io, .{ .argv = diff_cmd.items }) catch continue;
+                defer allocator.free(result.stdout);
+                defer allocator.free(result.stderr);
+
+                if (result.stdout.len > 0) {
+                    try err.interface.print("  [{s}] {d} bytes diff\n", .{ folder.name, result.stdout.len });
+                    try err.flush();
+                    try diff_output_list.appendSlice(allocator, result.stdout);
+                    try diff_output_list.appendSlice(allocator, "\n");
+                }
+            }
+        } else |_| {
             try err.interface.print("Could not load workspace '{s}'. Falling back to single-repo mode.\n", .{slug});
             try err.flush();
+            active_slug = null;
             try collectSingleRepoDiff(allocator, io, args, &diff_output_list);
-            return;
-        };
-        defer ws.deinit();
-
-        try err.interface.print("Workspace: {s} — running review across {d} repos...\n", .{ ws.name, ws.folders.items.len });
-        try err.flush();
-
-        for (ws.folders.items) |folder| {
-            var diff_cmd = std.ArrayList([]const u8).empty;
-            defer diff_cmd.deinit(allocator);
-
-            try diff_cmd.appendSlice(allocator, &[_][]const u8{ "git", "-C", folder.path, "diff" });
-            if (args.len > 2) {
-                try diff_cmd.appendSlice(allocator, args[2..]);
-            } else {
-                try diff_cmd.append(allocator, "HEAD");
-            }
-
-            const result = std.process.run(allocator, io, .{ .argv = diff_cmd.items }) catch continue;
-            defer allocator.free(result.stdout);
-            defer allocator.free(result.stderr);
-
-            if (result.stdout.len > 0) {
-                try err.interface.print("  [{s}] {d} bytes diff\n", .{ folder.name, result.stdout.len });
-                try err.flush();
-                try diff_output_list.appendSlice(allocator, result.stdout);
-                try diff_output_list.appendSlice(allocator, "\n");
-            }
         }
     } else {
         // Single-repo mode
@@ -87,8 +90,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     }
 
     // Load the knowledge graph
-    const store_slug = slug_opt orelse std.fs.path.basename(workspace_path);
-    var store = if (slug_opt != null)
+    const store_slug = active_slug orelse std.fs.path.basename(workspace_path);
+    var store = if (active_slug != null)
         try storage.Storage.initWithSlug(allocator, io, home_dir, store_slug)
     else
         try storage.Storage.init(allocator, io, workspace_path, home_dir);
@@ -139,7 +142,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
                             var end_line = start_line;
                             if (num_parts.next()) |range_str| {
                                 const range = std.fmt.parseInt(u32, range_str, 10) catch continue;
-                                end_line = start_line + range;
+                                end_line = hunkEndLine(start_line, range);
                             }
 
                             for (knowledge_graph.nodes.items) |node| {
@@ -149,88 +152,27 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
                                         first_match = false;
 
                                         try out.interface.print("  {{\n", .{});
-                                        try out.interface.print("    \"file\": \"{s}\",\n", .{f_path});
-                                        try out.interface.print("    \"node\": \"{s}\",\n", .{node.name});
-                                        try out.interface.print("    \"type\": \"{s}\",\n", .{@tagName(node.type)});
+                                        try out.interface.print("    \"file\": ", .{});
+                                        try writeJsonString(&out.interface, f_path);
+                                        try out.interface.print(",\n", .{});
+                                        try out.interface.print("    \"node\": ", .{});
+                                        try writeJsonString(&out.interface, node.name);
+                                        try out.interface.print(",\n", .{});
+                                        try out.interface.print("    \"type\": ", .{});
+                                        try writeJsonString(&out.interface, @tagName(node.type));
+                                        try out.interface.print(",\n", .{});
                                         try out.interface.print("    \"start_line\": {d},\n", .{node.start_line});
                                         try out.interface.print("    \"end_line\": {d},\n", .{node.end_line});
                                         try out.interface.print("    \"agents_required\": [\n", .{});
 
-                                        // === Core agents: always spawned ===
-                                        try out.interface.print("      \"bloat-hunter\",\n", .{});
-                                        try out.interface.print("      \"edge-case-hunter\",\n", .{});
-                                        try out.interface.print("      \"observability-hunter\",\n", .{});
-
-                                        // === Migration files ===
-                                        const is_migration = std.mem.indexOf(u8, f_path, "migration") != null or
-                                            std.mem.indexOf(u8, f_path, "migrate") != null or
-                                            std.mem.endsWith(u8, f_path, ".sql");
-                                        if (is_migration) {
-                                            try out.interface.print("      \"migration-safety-hunter\",\n", .{});
+                                        var first_agent = true;
+                                        for (agent_names) |agent| {
+                                            if (shouldUseAgent(f_path, agent)) {
+                                                try writeAgent(&out.interface, &first_agent, agent);
+                                            }
                                         }
 
-                                        // === Go files: concurrency + memory leaks ===
-                                        const is_go = std.mem.endsWith(u8, f_path, ".go");
-                                        if (is_go) {
-                                            try out.interface.print("      \"memory-leak-hunter\",\n", .{});
-                                            try out.interface.print("      \"concurrency-hunter\",\n", .{});
-                                        }
-
-                                        // === API routes / controllers ===
-                                        const is_route = std.mem.indexOf(u8, f_path, "route") != null or
-                                            std.mem.indexOf(u8, f_path, "handler") != null or
-                                            std.mem.indexOf(u8, f_path, "controller") != null or
-                                            std.mem.indexOf(u8, f_path, "api") != null;
-                                        if (is_route) {
-                                            try out.interface.print("      \"security-hunter\",\n", .{});
-                                            try out.interface.print("      \"api-contract-hunter\",\n", .{});
-                                            try out.interface.print("      \"data-validation-hunter\",\n", .{});
-                                        }
-
-                                        // === DB / repository layer ===
-                                        const is_db = std.mem.indexOf(u8, f_path, "repo") != null or
-                                            std.mem.indexOf(u8, f_path, "query") != null or
-                                            std.mem.indexOf(u8, f_path, "store") != null or
-                                            std.mem.indexOf(u8, f_path, "db") != null or
-                                            std.mem.indexOf(u8, f_path, "database") != null;
-                                        if (is_db) {
-                                            try out.interface.print("      \"n-plus-one-hunter\",\n", .{});
-                                            try out.interface.print("      \"transaction-hunter\",\n", .{});
-                                        }
-
-                                        // === Config / env / manifest files ===
-                                        const is_config = std.mem.indexOf(u8, f_path, "config") != null or
-                                            std.mem.indexOf(u8, f_path, ".env") != null or
-                                            std.mem.endsWith(u8, f_path, ".yaml") or
-                                            std.mem.endsWith(u8, f_path, ".toml");
-                                        if (is_config) {
-                                            try out.interface.print("      \"config-env-hunter\",\n", .{});
-                                        }
-
-                                        // === Dependency manifests ===
-                                        const is_deps = std.mem.endsWith(u8, f_path, "package.json") or
-                                            std.mem.endsWith(u8, f_path, "go.mod") or
-                                            std.mem.endsWith(u8, f_path, "go.sum") or
-                                            std.mem.endsWith(u8, f_path, "Cargo.toml") or
-                                            std.mem.endsWith(u8, f_path, "requirements.txt");
-                                        if (is_deps) {
-                                            try out.interface.print("      \"dependency-hunter\",\n", .{});
-                                        }
-
-                                        // === HTTP service calls (resilience) ===
-                                        const is_service = std.mem.indexOf(u8, f_path, "client") != null or
-                                            std.mem.indexOf(u8, f_path, "service") != null or
-                                            std.mem.indexOf(u8, f_path, "http") != null;
-                                        if (is_service) {
-                                            try out.interface.print("      \"timeout-retry-hunter\"\n", .{});
-                                        } else {
-                                            // close the array cleanly when timeout-retry not last
-                                            // (we need to strip trailing comma from last entry)
-                                            // Already handled: last non-conditional is observability
-                                            try out.interface.print("      \"timeout-retry-hunter\"\n", .{});
-                                        }
-
-                                        try out.interface.print("    ]\n", .{});
+                                        try out.interface.print("\n    ]\n", .{});
                                         try out.interface.print("  }}", .{});
                                     }
                                 }
@@ -244,6 +186,176 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
 
     try out.interface.print("\n]\n", .{});
     try out.flush();
+}
+
+const agent_names = [_][]const u8{
+    "bloat-hunter",
+    "edge-case-hunter",
+    "observability-hunter",
+    "migration-safety-hunter",
+    "memory-leak-hunter",
+    "concurrency-hunter",
+    "async-hunter",
+    "security-hunter",
+    "api-contract-hunter",
+    "data-validation-hunter",
+    "n-plus-one-hunter",
+    "transaction-hunter",
+    "config-env-hunter",
+    "dependency-hunter",
+    "timeout-retry-hunter",
+};
+
+fn hunkEndLine(start_line: u32, range: u32) u32 {
+    return if (range == 0) start_line else start_line + range - 1;
+}
+
+fn shouldUseAgent(f_path: []const u8, agent: []const u8) bool {
+    if (std.mem.eql(u8, agent, "bloat-hunter") or
+        std.mem.eql(u8, agent, "edge-case-hunter") or
+        std.mem.eql(u8, agent, "observability-hunter")) return true;
+
+    if (std.mem.eql(u8, agent, "migration-safety-hunter")) return isMigration(f_path);
+    if (std.mem.eql(u8, agent, "memory-leak-hunter")) return isGo(f_path);
+    if (std.mem.eql(u8, agent, "concurrency-hunter")) return isGo(f_path);
+    if (std.mem.eql(u8, agent, "async-hunter")) return isJsTs(f_path);
+    if (std.mem.eql(u8, agent, "security-hunter")) return isRoute(f_path);
+    if (std.mem.eql(u8, agent, "api-contract-hunter")) return isRoute(f_path);
+    if (std.mem.eql(u8, agent, "data-validation-hunter")) return isRoute(f_path);
+    if (std.mem.eql(u8, agent, "n-plus-one-hunter")) return isDb(f_path);
+    if (std.mem.eql(u8, agent, "transaction-hunter")) return isDb(f_path);
+    if (std.mem.eql(u8, agent, "config-env-hunter")) return isConfig(f_path);
+    if (std.mem.eql(u8, agent, "dependency-hunter")) return isDeps(f_path);
+    if (std.mem.eql(u8, agent, "timeout-retry-hunter")) return isService(f_path);
+    return false;
+}
+
+fn isMigration(f_path: []const u8) bool {
+    return std.mem.indexOf(u8, f_path, "migration") != null or
+        std.mem.indexOf(u8, f_path, "migrate") != null or
+        std.mem.endsWith(u8, f_path, ".sql");
+}
+
+fn isGo(f_path: []const u8) bool {
+    return std.mem.endsWith(u8, f_path, ".go");
+}
+
+fn isJsTs(f_path: []const u8) bool {
+    return std.mem.endsWith(u8, f_path, ".ts") or
+        std.mem.endsWith(u8, f_path, ".tsx") or
+        std.mem.endsWith(u8, f_path, ".js") or
+        std.mem.endsWith(u8, f_path, ".jsx");
+}
+
+fn isRoute(f_path: []const u8) bool {
+    return std.mem.indexOf(u8, f_path, "route") != null or
+        std.mem.indexOf(u8, f_path, "handler") != null or
+        std.mem.indexOf(u8, f_path, "controller") != null or
+        std.mem.indexOf(u8, f_path, "api") != null;
+}
+
+fn isDb(f_path: []const u8) bool {
+    return std.mem.indexOf(u8, f_path, "repo") != null or
+        std.mem.indexOf(u8, f_path, "query") != null or
+        std.mem.indexOf(u8, f_path, "store") != null or
+        std.mem.indexOf(u8, f_path, "db") != null or
+        std.mem.indexOf(u8, f_path, "database") != null;
+}
+
+fn isConfig(f_path: []const u8) bool {
+    return std.mem.indexOf(u8, f_path, "config") != null or
+        std.mem.indexOf(u8, f_path, ".env") != null or
+        std.mem.endsWith(u8, f_path, ".yaml") or
+        std.mem.endsWith(u8, f_path, ".toml");
+}
+
+fn isDeps(f_path: []const u8) bool {
+    return std.mem.endsWith(u8, f_path, "package.json") or
+        std.mem.endsWith(u8, f_path, "go.mod") or
+        std.mem.endsWith(u8, f_path, "go.sum") or
+        std.mem.endsWith(u8, f_path, "Cargo.toml") or
+        std.mem.endsWith(u8, f_path, "requirements.txt");
+}
+
+fn isService(f_path: []const u8) bool {
+    return std.mem.indexOf(u8, f_path, "client") != null or
+        std.mem.indexOf(u8, f_path, "service") != null or
+        std.mem.indexOf(u8, f_path, "http") != null;
+}
+
+fn writeAgent(writer: anytype, first_agent: *bool, name: []const u8) !void {
+    if (!first_agent.*) try writer.print(",\n", .{});
+    first_agent.* = false;
+    try writer.print("      ", .{});
+    try writeJsonString(writer, name);
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try writer.print("\"", .{});
+    for (value) |c| {
+        switch (c) {
+            '\\' => try writer.print("\\\\", .{}),
+            '"' => try writer.print("\\\"", .{}),
+            '\n' => try writer.print("\\n", .{}),
+            '\r' => try writer.print("\\r", .{}),
+            '\t' => try writer.print("\\t", .{}),
+            else => try writer.print("{c}", .{c}),
+        }
+    }
+    try writer.print("\"", .{});
+}
+
+test "hunk end line uses inclusive git range" {
+    try std.testing.expectEqual(@as(u32, 12), hunkEndLine(10, 3));
+    try std.testing.expectEqual(@as(u32, 10), hunkEndLine(10, 1));
+    try std.testing.expectEqual(@as(u32, 10), hunkEndLine(10, 0));
+}
+
+test "agent selection covers file classes" {
+    try std.testing.expect(shouldUseAgent("src/api-client.ts", "bloat-hunter"));
+    try std.testing.expect(shouldUseAgent("src/api-client.ts", "async-hunter"));
+    try std.testing.expect(shouldUseAgent("src/api-client.ts", "security-hunter"));
+    try std.testing.expect(shouldUseAgent("src/api-client.ts", "api-contract-hunter"));
+    try std.testing.expect(shouldUseAgent("src/api-client.ts", "data-validation-hunter"));
+    try std.testing.expect(shouldUseAgent("src/api-client.ts", "timeout-retry-hunter"));
+
+    try std.testing.expect(shouldUseAgent("internal/server.go", "memory-leak-hunter"));
+    try std.testing.expect(shouldUseAgent("internal/server.go", "concurrency-hunter"));
+    try std.testing.expect(!shouldUseAgent("internal/server.go", "async-hunter"));
+
+    try std.testing.expect(shouldUseAgent("db/migrations/001_init.sql", "migration-safety-hunter"));
+    try std.testing.expect(shouldUseAgent("src/user-repo.ts", "n-plus-one-hunter"));
+    try std.testing.expect(shouldUseAgent("src/user-repo.ts", "transaction-hunter"));
+    try std.testing.expect(shouldUseAgent("config/app.yaml", "config-env-hunter"));
+    try std.testing.expect(shouldUseAgent("package.json", "dependency-hunter"));
+    try std.testing.expect(!shouldUseAgent("src/plain.ts", "timeout-retry-hunter"));
+}
+
+const TestWriter = struct {
+    allocator: std.mem.Allocator,
+    buf: std.ArrayList(u8),
+
+    fn init(allocator: std.mem.Allocator) TestWriter {
+        return .{ .allocator = allocator, .buf = std.ArrayList(u8).empty };
+    }
+
+    fn deinit(self: *TestWriter) void {
+        self.buf.deinit(self.allocator);
+    }
+
+    fn print(self: *TestWriter, comptime fmt: []const u8, args: anytype) !void {
+        const s = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(s);
+        try self.buf.appendSlice(self.allocator, s);
+    }
+};
+
+test "json strings are escaped" {
+    var w = TestWriter.init(std.testing.allocator);
+    defer w.deinit();
+
+    try writeJsonString(&w, "a\\b\"c\n");
+    try std.testing.expectEqualStrings("\"a\\\\b\\\"c\\n\"", w.buf.items);
 }
 
 fn collectSingleRepoDiff(allocator: std.mem.Allocator, io: std.Io, args: []const [:0]const u8, diff_output_list: *std.ArrayList(u8)) !void {

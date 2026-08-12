@@ -88,6 +88,9 @@ fn runSingleFolder(allocator: std.mem.Allocator, io: std.Io, workspace_path: []c
     else blk: {
         const cwd = try std.process.currentPathAlloc(io, allocator);
         defer allocator.free(cwd);
+        if (std.mem.eql(u8, workspace_path, ".")) {
+            break :blk try allocator.dupe(u8, cwd);
+        }
         break :blk try std.fs.path.join(allocator, &[_][]const u8{ cwd, workspace_path });
     };
     defer allocator.free(absolute_workspace_path);
