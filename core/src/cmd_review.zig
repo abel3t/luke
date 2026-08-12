@@ -26,12 +26,44 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     defer diff_output_list.deinit(allocator);
 
     if (args.len >= 3 and std.mem.eql(u8, args[2], "--pr")) {
-        // PR mode: fetch diffs from gh for each PR number
-        for (args[3..]) |pr| {
-            const argv = [_][]const u8{ "gh", "pr", "diff", pr };
-            const result = std.process.run(allocator, io, .{ .argv = &argv }) catch continue;
+        // PR mode: never let gh infer the repo in a multi-repo workspace.
+        // Accepted forms:
+        //   luke review --pr https://github.com/owner/repo/pull/123
+        //   luke review --pr owner/repo#123
+        //   luke review --pr owner/repo 123
+        //   luke review --pr -R owner/repo 123
+        var specs = try parsePrArgs(allocator, args[3..]);
+        defer {
+            for (specs.items) |spec| {
+                allocator.free(spec.repo);
+                allocator.free(spec.pr);
+            }
+            specs.deinit(allocator);
+        }
+
+        if (specs.items.len == 0) {
+            try err.interface.print(
+                "Not enough PR info. Use: luke review --pr https://github.com/owner/repo/pull/123 or luke review --pr owner/repo#123\n",
+                .{},
+            );
+            try err.flush();
+            return;
+        }
+
+        for (specs.items) |spec| {
+            const argv = [_][]const u8{ "gh", "pr", "diff", spec.pr, "-R", spec.repo };
+            const result = std.process.run(allocator, io, .{ .argv = &argv }) catch |e| {
+                try err.interface.print("Failed to run gh for {s}#{s}: {any}\n", .{ spec.repo, spec.pr, e });
+                try err.flush();
+                continue;
+            };
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
+            if (!result.term.success()) {
+                try err.interface.print("gh pr diff failed for {s}#{s}: {s}\n", .{ spec.repo, spec.pr, result.stderr });
+                try err.flush();
+                continue;
+            }
             try diff_output_list.appendSlice(allocator, result.stdout);
             try diff_output_list.appendSlice(allocator, "\n");
         }
@@ -186,6 +218,103 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
 
     try out.interface.print("\n]\n", .{});
     try out.flush();
+}
+
+const PrSpec = struct {
+    repo: []const u8,
+    pr: []const u8,
+};
+
+fn parsePrArgs(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !std.ArrayList(PrSpec) {
+    var specs = std.ArrayList(PrSpec).empty;
+    errdefer {
+        for (specs.items) |spec| {
+            allocator.free(spec.repo);
+            allocator.free(spec.pr);
+        }
+        specs.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < raw_args.len) {
+        const arg = raw_args[i];
+
+        if (std.mem.eql(u8, arg, "-R") or std.mem.eql(u8, arg, "--repo")) {
+            if (i + 2 >= raw_args.len) break;
+            try appendPrSpec(&specs, allocator, raw_args[i + 1], raw_args[i + 2]);
+            i += 3;
+            continue;
+        }
+
+        if (parseGithubPrUrl(allocator, arg)) |spec| {
+            try specs.append(allocator, spec);
+            i += 1;
+            continue;
+        } else |_| {}
+
+        if (parseRepoHashPr(allocator, arg)) |spec| {
+            try specs.append(allocator, spec);
+            i += 1;
+            continue;
+        } else |_| {}
+
+        if (looksLikeRepo(arg) and i + 1 < raw_args.len and looksLikePrNumber(raw_args[i + 1])) {
+            try appendPrSpec(&specs, allocator, arg, raw_args[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        // Bare PR numbers are ambiguous in multi-repo workspaces. Ignore them so
+        // callers get the "not enough PR info" message instead of a wrong review.
+        i += 1;
+    }
+
+    return specs;
+}
+
+fn appendPrSpec(specs: *std.ArrayList(PrSpec), allocator: std.mem.Allocator, repo: []const u8, pr: []const u8) !void {
+    try specs.append(allocator, .{
+        .repo = try allocator.dupe(u8, repo),
+        .pr = try allocator.dupe(u8, pr),
+    });
+}
+
+fn parseGithubPrUrl(allocator: std.mem.Allocator, value: []const u8) !PrSpec {
+    const marker = "github.com/";
+    const start = (std.mem.indexOf(u8, value, marker) orelse return error.InvalidPrSpec) + marker.len;
+    const rest = value[start..];
+
+    var parts = std.mem.splitScalar(u8, rest, '/');
+    const owner = parts.next() orelse return error.InvalidPrSpec;
+    const repo = parts.next() orelse return error.InvalidPrSpec;
+    const pull = parts.next() orelse return error.InvalidPrSpec;
+    const pr = parts.next() orelse return error.InvalidPrSpec;
+    if (!std.mem.eql(u8, pull, "pull") or !looksLikePrNumber(pr)) return error.InvalidPrSpec;
+
+    const repo_full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner, repo });
+    errdefer allocator.free(repo_full);
+    return .{ .repo = repo_full, .pr = try allocator.dupe(u8, pr) };
+}
+
+fn parseRepoHashPr(allocator: std.mem.Allocator, value: []const u8) !PrSpec {
+    const sep = std.mem.indexOfScalar(u8, value, '#') orelse return error.InvalidPrSpec;
+    const repo = value[0..sep];
+    const pr = value[sep + 1 ..];
+    if (!looksLikeRepo(repo) or !looksLikePrNumber(pr)) return error.InvalidPrSpec;
+    return .{ .repo = try allocator.dupe(u8, repo), .pr = try allocator.dupe(u8, pr) };
+}
+
+fn looksLikeRepo(value: []const u8) bool {
+    const sep = std.mem.indexOfScalar(u8, value, '/') orelse return false;
+    return sep > 0 and sep + 1 < value.len;
+}
+
+fn looksLikePrNumber(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
 }
 
 const agent_names = [_][]const u8{

@@ -10,6 +10,8 @@ Output exactly this text, nothing else:
 - `/luke help`: Show this menu.
 - `/luke query <target>`: Query AST dependencies and blast radius.
 - `/luke review [range|--pr ...]`: Audit diff with Luke.
-- `/luke-help`, `/luke-query`, `/luke-review`: Direct aliases.
+- `/luke commit`: Summarize changes and propose a commit message.
+- `/luke commit --apply`: Commit current changes without AI co-author metadata.
+- `/luke-help`, `/luke-query`, `/luke-review`, `/luke-commit`: Direct aliases.
 
 Luke is active. Speak less. Write less.

@@ -78,7 +78,8 @@ function sendSkill(pi, skillName, args, ctx) {
 
 export default function lukeExtension(pi) {
 	pi.registerCommand("luke", {
-		description: "Luke commands: help, query <target>, review [range|--pr ...]",
+		description:
+			"Luke commands: help, query <target>, review [range|--pr ...], commit",
 		handler: async (args, ctx) => {
 			const [command, ...rest] = splitArgs(args);
 			const forwarded = rest.join(" ");
@@ -89,9 +90,11 @@ export default function lukeExtension(pi) {
 				return sendSkill(pi, "luke-query", forwarded, ctx);
 			if (command === "review")
 				return sendSkill(pi, "luke-review", forwarded, ctx);
+			if (command === "commit")
+				return sendSkill(pi, "luke-commit", forwarded, ctx);
 
 			ctx?.ui?.notify?.(
-				"Unknown Luke command. Use /luke help, /luke query <target>, or /luke review.",
+				"Unknown Luke command. Use /luke help, /luke query <target>, /luke review, or /luke commit.",
 				"warning",
 			);
 		},
@@ -101,6 +104,7 @@ export default function lukeExtension(pi) {
 		["luke-help", "luke-help"],
 		["luke-query", "luke-query"],
 		["luke-review", "luke-review"],
+		["luke-commit", "luke-commit"],
 	]) {
 		pi.registerCommand(name, {
 			description: `Run /skill:${skill}`,

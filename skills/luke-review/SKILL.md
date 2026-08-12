@@ -13,7 +13,17 @@ Run the native Zig binary:
 ```
 luke review
 ```
-If the user provided a commit hash or PR number, pass it as an argument (e.g., `luke review HEAD~1..HEAD` or `luke review --pr 123 456`).
+If the user provided a commit hash or range, pass it as an argument (e.g., `luke review HEAD~1..HEAD`).
+
+For PR review, require an explicit repository or PR link. Valid forms:
+```bash
+luke review --pr https://github.com/owner/repo/pull/123
+luke review --pr owner/repo#123
+luke review --pr owner/repo 123
+luke review --pr -R owner/repo 123
+```
+
+Do NOT review a bare PR number like `luke review --pr 123`; in multi-repo workspaces it is ambiguous. If the user provides only a PR number or otherwise lacks enough data, stop and ask for a GitHub PR link or `owner/repo#number`.
 
 ## Step 2: Parse the JSON Payload
 
