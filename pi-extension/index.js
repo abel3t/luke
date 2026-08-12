@@ -84,9 +84,11 @@ export default function lukeExtension(pi) {
 			const forwarded = rest.join(" ");
 
 			if (!command || command === "help")
-				return sendSkill(pi, "help", forwarded, ctx);
-			if (command === "query") return sendSkill(pi, "query", forwarded, ctx);
-			if (command === "review") return sendSkill(pi, "review", forwarded, ctx);
+				return sendSkill(pi, "luke-help", forwarded, ctx);
+			if (command === "query")
+				return sendSkill(pi, "luke-query", forwarded, ctx);
+			if (command === "review")
+				return sendSkill(pi, "luke-review", forwarded, ctx);
 
 			ctx?.ui?.notify?.(
 				"Unknown Luke command. Use /luke help, /luke query <target>, or /luke review.",
@@ -96,9 +98,9 @@ export default function lukeExtension(pi) {
 	});
 
 	for (const [name, skill] of [
-		["luke-help", "help"],
-		["luke-query", "query"],
-		["luke-review", "review"],
+		["luke-help", "luke-help"],
+		["luke-query", "luke-query"],
+		["luke-review", "luke-review"],
 	]) {
 		pi.registerCommand(name, {
 			description: `Run /skill:${skill}`,

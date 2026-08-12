@@ -1,9 +1,9 @@
 ---
-name: query
+name: luke-query
 description: "Query the Luke AST knowledge graph to understand the dependencies and blast radius of any file, function, or class."
 ---
 
-# `luke:query` Skill
+# `luke-query` Skill
 
 You have access to a powerful internal AST knowledge graph built using the `luke` CLI engine.
 
