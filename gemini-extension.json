@@ -1,0 +1,10 @@
+{
+  "name": "luke",
+  "version": "0.0.1",
+  "description": "Luke: The lazy senior dev who speaks less and writes less.",
+  "skills": [
+    "skills/review",
+    "skills/help",
+    "skills/query"
+  ]
+}

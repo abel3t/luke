@@ -1,0 +1,8 @@
+node_modules
+
+.zig-cache
+zig-pkg
+zig-out
+
+.DS_Store
+core/vendor/
