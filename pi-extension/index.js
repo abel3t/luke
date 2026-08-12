@@ -9,6 +9,13 @@ const packageRoot = resolve(__dirname, "..");
 const lukeBin = resolve(packageRoot, "bin", "luke");
 const lukeBinDir = dirname(lukeBin);
 
+function injectLukePath() {
+	const parts = String(process.env.PATH || "").split(":");
+	if (!parts.includes(lukeBinDir)) {
+		process.env.PATH = `${lukeBinDir}:${process.env.PATH || ""}`;
+	}
+}
+
 function splitArgs(text) {
 	return (
 		String(text || "")
@@ -77,6 +84,8 @@ function sendSkill(pi, skillName, args, ctx) {
 }
 
 export default function lukeExtension(pi) {
+	injectLukePath();
+
 	pi.registerCommand("luke", {
 		description:
 			"Luke commands: help, query <target>, review [range|--pr ...], commit",
