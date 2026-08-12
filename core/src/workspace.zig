@@ -51,7 +51,7 @@ pub const Workspace = struct {
     }
 
     pub fn save(self: *Workspace, io: std.Io, dir_path: []const u8) !void {
-        const file_path = try std.fmt.allocPrint(self.allocator, "{s}/workspace.txt", .{dir_path});
+        const file_path = try std.fmt.allocPrint(self.allocator, "{s}/workspace.json", .{dir_path});
         defer self.allocator.free(file_path);
 
         var file = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
@@ -59,10 +59,20 @@ pub const Workspace = struct {
 
         var buf: [4096]u8 = undefined;
         var w = file.writer(io, &buf);
-        try w.interface.print("name={s}\n", .{self.name});
-        for (self.folders.items) |f| {
-            try w.interface.print("folder={s}|{s}\n", .{ f.name, f.path });
+        try w.interface.print("{{\n  \"version\": 1,\n  \"name\": ", .{});
+        try writeJsonString(&w.interface, self.name);
+        try w.interface.print(",\n  \"slug\": ", .{});
+        try writeJsonString(&w.interface, self.slug);
+        try w.interface.print(",\n  \"folders\": [\n", .{});
+        for (self.folders.items, 0..) |f, i| {
+            if (i > 0) try w.interface.print(",\n", .{});
+            try w.interface.print("    {{ \"name\": ", .{});
+            try writeJsonString(&w.interface, f.name);
+            try w.interface.print(", \"path\": ", .{});
+            try writeJsonString(&w.interface, f.path);
+            try w.interface.print(" }}", .{});
         }
+        try w.interface.print("\n  ]\n}}\n", .{});
         try w.flush();
     }
 
@@ -71,35 +81,36 @@ pub const Workspace = struct {
         defer dir.close(io);
 
         const limit = @as(std.Io.Limit, @enumFromInt(1024 * 64));
-        const content = try dir.readFileAlloc(io, "workspace.txt", allocator, limit);
+        const content = try dir.readFileAlloc(io, "workspace.json", allocator, limit);
         defer allocator.free(content);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const name = root.get("name") orelse return error.InvalidWorkspaceJson;
+        const slug = root.get("slug") orelse return error.InvalidWorkspaceJson;
+        if (name != .string or slug != .string) return error.InvalidWorkspaceJson;
 
         var ws = Workspace{
             .allocator = allocator,
-            .name = try allocator.dupe(u8, ""),
-            .slug = try allocator.dupe(u8, ""),
+            .name = try allocator.dupe(u8, name.string),
+            .slug = try allocator.dupe(u8, slug.string),
             .folders = std.ArrayList(Folder).empty,
         };
+        errdefer ws.deinit();
 
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            const t = std.mem.trim(u8, line, " \r\t");
-            if (t.len == 0) continue;
-            if (std.mem.startsWith(u8, t, "name=")) {
-                allocator.free(ws.name);
-                allocator.free(ws.slug);
-                ws.name = try allocator.dupe(u8, t[5..]);
-                ws.slug = try slugify(allocator, ws.name);
-            } else if (std.mem.startsWith(u8, t, "folder=")) {
-                const rest = t[7..];
-                if (std.mem.indexOf(u8, rest, "|")) |sep| {
-                    try ws.folders.append(allocator, .{
-                        .name = try allocator.dupe(u8, rest[0..sep]),
-                        .path = try allocator.dupe(u8, rest[sep + 1 ..]),
-                    });
-                }
+        if (root.get("folders")) |folders| {
+            if (folders != .array) return error.InvalidWorkspaceJson;
+            for (folders.array.items) |item| {
+                if (item != .object) return error.InvalidWorkspaceJson;
+                const folder_name = item.object.get("name") orelse return error.InvalidWorkspaceJson;
+                const folder_path = item.object.get("path") orelse return error.InvalidWorkspaceJson;
+                if (folder_name != .string or folder_path != .string) return error.InvalidWorkspaceJson;
+                try ws.addFolder(folder_name.string, folder_path.string);
             }
         }
+
         return ws;
     }
 };
@@ -110,4 +121,19 @@ pub fn slugify(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
         slug[i] = if (c == ' ' or c == '_') '-' else std.ascii.toLower(c);
     }
     return slug;
+}
+
+fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
+    try w.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => try w.writeByte(c),
+        }
+    }
+    try w.writeByte('"');
 }

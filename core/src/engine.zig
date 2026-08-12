@@ -107,8 +107,6 @@ pub const AstEngine = struct {
                         try knowledge_graph.addNode(node_id, n_type, node_text, entry_path, start_point.row + 1, end_point.row + 1);
                         try knowledge_graph.addEdge(node_id, file_id, .Defines);
                         self.allocator.free(node_id);
-                        
-                        std.debug.print("  [{s}] -> {s}\n", .{capture_name, node_text});
                     }
                 }
             }

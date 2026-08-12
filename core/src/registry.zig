@@ -18,28 +18,12 @@ pub const Registry = struct {
             .home_dir = home_dir,
             .entries = std.ArrayList(Entry).empty,
         };
+        errdefer reg.deinit();
 
         const luke_dir = try std.fmt.allocPrint(allocator, "{s}/.luke", .{home_dir});
         defer allocator.free(luke_dir);
 
-        var dir = std.Io.Dir.openDirAbsolute(io, luke_dir, .{}) catch return reg;
-        defer dir.close(io);
-
-        const limit = @as(std.Io.Limit, @enumFromInt(1024 * 1024));
-        const content = dir.readFileAlloc(io, "registry.txt", allocator, limit) catch return reg;
-        defer allocator.free(content);
-
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            const t = std.mem.trim(u8, line, " \r\t");
-            if (t.len == 0) continue;
-            if (std.mem.indexOf(u8, t, "\t")) |tab| {
-                try reg.entries.append(allocator, .{
-                    .path = try allocator.dupe(u8, t[0..tab]),
-                    .slug = try allocator.dupe(u8, t[tab + 1 ..]),
-                });
-            }
-        }
+        loadJson(&reg, luke_dir) catch {};
         return reg;
     }
 
@@ -48,7 +32,7 @@ pub const Registry = struct {
         defer self.allocator.free(luke_dir);
         _ = std.process.run(self.allocator, self.io, .{ .argv = &[_][]const u8{ "mkdir", "-p", luke_dir } }) catch {};
 
-        const reg_path = try std.fmt.allocPrint(self.allocator, "{s}/registry.txt", .{luke_dir});
+        const reg_path = try std.fmt.allocPrint(self.allocator, "{s}/registry.json", .{luke_dir});
         defer self.allocator.free(reg_path);
 
         var file = try std.Io.Dir.createFileAbsolute(self.io, reg_path, .{});
@@ -56,9 +40,16 @@ pub const Registry = struct {
 
         var buf: [8192]u8 = undefined;
         var w = file.writer(self.io, &buf);
-        for (self.entries.items) |e| {
-            try w.interface.print("{s}\t{s}\n", .{ e.path, e.slug });
+        try w.interface.print("{{\n  \"version\": 1,\n  \"entries\": [\n", .{});
+        for (self.entries.items, 0..) |e, i| {
+            if (i > 0) try w.interface.print(",\n", .{});
+            try w.interface.print("    {{ \"path\": ", .{});
+            try writeJsonString(&w.interface, e.path);
+            try w.interface.print(", \"slug\": ", .{});
+            try writeJsonString(&w.interface, e.slug);
+            try w.interface.print(" }}", .{});
         }
+        try w.interface.print("\n  ]\n}}\n", .{});
         try w.flush();
     }
 
@@ -117,4 +108,44 @@ pub const Registry = struct {
         }
         return null;
     }
+
+    fn loadJson(self: *Registry, luke_dir: []const u8) !void {
+        var dir = try std.Io.Dir.openDirAbsolute(self.io, luke_dir, .{});
+        defer dir.close(self.io);
+
+        const limit = @as(std.Io.Limit, @enumFromInt(1024 * 1024));
+        const content = try dir.readFileAlloc(self.io, "registry.json", self.allocator, limit);
+        defer self.allocator.free(content);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        const entries = root.get("entries") orelse return error.InvalidRegistryJson;
+        if (entries != .array) return error.InvalidRegistryJson;
+
+        for (entries.array.items) |item| {
+            if (item != .object) return error.InvalidRegistryJson;
+            const path = item.object.get("path") orelse return error.InvalidRegistryJson;
+            const slug = item.object.get("slug") orelse return error.InvalidRegistryJson;
+            if (path != .string or slug != .string) return error.InvalidRegistryJson;
+            try self.register(path.string, slug.string);
+        }
+    }
+
 };
+
+fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
+    try w.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => try w.writeByte(c),
+        }
+    }
+    try w.writeByte('"');
+}

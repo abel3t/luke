@@ -213,7 +213,7 @@ fn cmdList(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, out: 
         defer allocator.free(ws_dir);
 
         var ws = workspace.Workspace.load(allocator, io, ws_dir) catch {
-            try err.interface.print("  [{s}] (could not read workspace.txt)\n", .{slug});
+            try err.interface.print("  [{s}] (could not read workspace.json)\n", .{slug});
             try err.flush();
             continue;
         };
