@@ -51,7 +51,11 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  init [path]           Crawl workspace and build the AST graph
-        \\  review [args]         Run the AST-aware multi-agent review
+        \\  review [args]         Plan AST-aware changed-line review
+        \\  review start [args]   Create a persistent review manifest
+        \\  review status <id>    Show review manifest progress
+        \\  review complete <id> <chunk>  Mark a reviewed chunk complete
+        \\  review finalize <id>  Refuse completion while chunks remain
         \\  query <target>        Query the graph for a node or file
         \\  workspace <sub>       Manage workspaces (create/add/remove/delete/list)
         \\
