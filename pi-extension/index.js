@@ -88,13 +88,16 @@ export default function lukeExtension(pi) {
 
 	pi.registerCommand("luke", {
 		description:
-			"Luke commands: help, query <target>, review [range|--pr ...], commit",
+			"Luke commands: help, load, index, query <target>, review [range|--pr ...], commit",
 		handler: async (args, ctx) => {
 			const [command, ...rest] = splitArgs(args);
 			const forwarded = rest.join(" ");
 
 			if (!command || command === "help")
 				return sendSkill(pi, "luke-help", forwarded, ctx);
+			if (command === "load") return sendSkill(pi, "luke-load", forwarded, ctx);
+			if (command === "index" || command === "init")
+				return sendSkill(pi, "luke-index", forwarded, ctx);
 			if (command === "query")
 				return sendSkill(pi, "luke-query", forwarded, ctx);
 			if (command === "review")
@@ -103,7 +106,7 @@ export default function lukeExtension(pi) {
 				return sendSkill(pi, "luke-commit", forwarded, ctx);
 
 			ctx?.ui?.notify?.(
-				"Unknown Luke command. Use /luke help, /luke query <target>, /luke review, or /luke commit.",
+				"Unknown Luke command. Use /luke help, /luke load, /luke index, /luke query <target>, /luke review, or /luke commit.",
 				"warning",
 			);
 		},
@@ -111,6 +114,8 @@ export default function lukeExtension(pi) {
 
 	for (const [name, skill] of [
 		["luke-help", "luke-help"],
+		["luke-load", "luke-load"],
+		["luke-index", "luke-index"],
 		["luke-query", "luke-query"],
 		["luke-review", "luke-review"],
 		["luke-commit", "luke-commit"],

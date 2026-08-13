@@ -83,33 +83,43 @@ pub const AstEngine = struct {
 
         var match: c.TSQueryMatch = undefined;
         while (c.ts_query_cursor_next_match(self.query_cursor, &match)) {
-            if (match.capture_count > 0) {
-                const capture = match.captures[0];
+            var def_node: ?c.TSNode = null;
+            var name_node: ?c.TSNode = null;
+            var def_capture_name: []const u8 = "";
+
+            for (match.captures[0..match.capture_count]) |capture| {
                 var capture_len: u32 = 0;
                 const capture_name_ptr = c.ts_query_capture_name_for_id(query, capture.index, &capture_len);
                 const capture_name = capture_name_ptr[0..capture_len];
-                
-                const start = c.ts_node_start_byte(capture.node);
-                const end = c.ts_node_end_byte(capture.node);
-                if (start < end and end <= content.len) {
-                    const node_text = content[start..end];
-                    
-                    // Convert tree-sitter capture tag to Graph NodeType
-                    var n_type = graph.NodeType.Function;
-                    if (std.mem.indexOf(u8, capture_name, "class") != null) n_type = .Class;
-                    if (std.mem.indexOf(u8, capture_name, "struct") != null) n_type = .Struct;
-                    
-                    if (node_text.len < 150) {
-                        const start_point = c.ts_node_start_point(capture.node);
-                        const end_point = c.ts_node_end_point(capture.node);
-                        
-                        const node_id = try std.fmt.allocPrint(self.allocator, "node://{s}/{s}", .{entry_path, node_text});
-                        try knowledge_graph.addNode(node_id, n_type, node_text, entry_path, start_point.row + 1, end_point.row + 1);
-                        try knowledge_graph.addEdge(node_id, file_id, .Defines);
-                        self.allocator.free(node_id);
-                    }
+
+                if (std.mem.startsWith(u8, capture_name, "definition.")) {
+                    def_node = capture.node;
+                    def_capture_name = capture_name;
+                } else if (std.mem.endsWith(u8, capture_name, ".name")) {
+                    name_node = capture.node;
                 }
             }
+
+            const d_node = def_node orelse continue;
+            const n_node = name_node orelse d_node;
+
+            const name_start = c.ts_node_start_byte(n_node);
+            const name_end = c.ts_node_end_byte(n_node);
+            if (name_start >= name_end or name_end > content.len) continue;
+            const node_name = content[name_start..name_end];
+            if (node_name.len == 0 or node_name.len > 150) continue;
+
+            const start_point = c.ts_node_start_point(d_node);
+            const end_point = c.ts_node_end_point(d_node);
+
+            var n_type = graph.NodeType.Function;
+            if (std.mem.indexOf(u8, def_capture_name, "class") != null) n_type = .Class;
+            if (std.mem.indexOf(u8, def_capture_name, "struct") != null) n_type = .Struct;
+
+            const node_id = try std.fmt.allocPrint(self.allocator, "node://{s}/{s}", .{ entry_path, node_name });
+            try knowledge_graph.addNode(node_id, n_type, node_name, entry_path, start_point.row + 1, end_point.row + 1);
+            try knowledge_graph.addEdge(node_id, file_id, .Defines);
+            self.allocator.free(node_id);
         }
         self.allocator.free(file_id);
     }

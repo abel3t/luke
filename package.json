@@ -18,6 +18,7 @@
 		]
 	},
 	"scripts": {
+		"build:core": "cd core && zig build && cp zig-out/bin/core ../bin/luke",
 		"format": "biome format --write .",
 		"lint": "biome lint .",
 		"check": "biome check --apply .",
