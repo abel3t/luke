@@ -1,75 +1,52 @@
 ---
 name: luke-review
-description: Orchestrates a strict AST-aware review of local changes or PRs.
+description: Runs a manifest-backed AST-aware review of local changes or an explicit PR.
 ---
 
-# Luke Review Coordinator
+# Luke Review
 
-When this skill is activated, use the Luke CLI to inspect changed code before reviewing.
+The automated extension command is the user-facing entrypoint:
 
-## Step 1: Execute the AST Diff Engine
+```text
+/luke review <range-or-explicit-PR>
+```
 
-Create a persistent review manifest:
+It resolves an explicit PR to a detached PR-head worktree, runs isolated read-only workers one unit at a time, submits structured evidence, runs `git diff --check`, and finalizes only after all units succeed. Use `/luke-review <target>` as its direct alias. Do not use `/skill:luke-review` as an orchestration entrypoint.
+
+For manual or non-Pi use, start a review with exactly one Luke command:
+
 ```bash
 luke review start
 ```
 
-The command writes a manifest under `~/.luke/reviews/` and returns a run id. Use:
+For a range, append it (for example `luke review start HEAD~1..HEAD`). For a PR, an explicit repository is required:
+
 ```bash
-luke review status <run-id>
-luke review complete <run-id> <chunk-id>
-luke review finalize <run-id>
+luke review start --pr https://github.com/owner/repo/pull/123
+luke review start --pr owner/repo#123
 ```
 
-`finalize` must fail until every assigned chunk is complete.
-If the user provided a commit hash or range, pass it as an argument (e.g., `luke review HEAD~1..HEAD`).
+Never accept a bare PR number. Do not print or request the complete chunk plan: start emits only a compact run and coverage summary.
 
-For PR review, require an explicit repository or PR link. Valid forms:
-```bash
-luke review --pr https://github.com/owner/repo/pull/123
-luke review --pr owner/repo#123
-luke review --pr owner/repo 123
-luke review --pr -R owner/repo 123
+`review next <run-id>` and `review submit <run-id> <chunk-id> <result.json>` are internal lifecycle commands. Use them only when an automated worker loop is available. A result JSON must acknowledge assigned ranges and give each finding a line, severity, mechanism, and fix. `review finalize <run-id>` is the only command that may establish completed coverage.
+
+Until finalization, say **planned coverage**, never “reviewed coverage.” Do not fabricate subagents: `review_lenses` are dimensions applied by the current reviewer.
+
+## Report
+
+Report findings by severity and location. Omit clean lens-by-lens chatter unless asked for verbose output. Always separately report verification results, including commands that failed or could not run; never translate a failed check into “No issues.”
+
+Use this concise shape:
+
+```text
+## Luke Review: <target>
+
+warning  path:line
+Mechanism and concrete fix.
+
+Verification
+✓ <check>
+✗ <failed/unavailable check>: <reason>
+
+Coverage: planned or reviewed <n>/<n> changed lines.
 ```
-
-Do NOT review a bare PR number like `luke review --pr 123`; in multi-repo workspaces it is ambiguous. If the user provides only a PR number or otherwise lacks enough data, stop and ask for a GitHub PR link or `owner/repo#number`.
-
-## Step 2: Parse the JSON Payload
-
-The Zig engine outputs an object with deterministic `coverage` and `chunks` fields. Each chunk contains:
-- `file` — the changed file path
-- `node` — the smallest enclosing AST symbol, or a file fallback
-- `type` — the AST node type
-- `start_line` / `end_line` — the source context range
-- `changed_ranges` — every changed line range assigned to this chunk
-- `review_lenses` — review dimensions to apply
-
-Do not claim the review is complete unless `uncovered_changed_lines` and failed chunks are zero.
-
-## Step 3: Review the Assigned Chunks
-
-For every chunk, inspect its exact source context plus its assigned diff ranges. Apply every requested `review_lens` yourself; Pi does not spawn Luke subagents. Do not skip a chunk or expand the scope silently.
-
-## Step 4: Synthesize the Report
-
-Synthesize findings into a single report printed directly into chat. Do NOT create a Markdown Artifact file.
-
-Format:
-```
-## Luke Review: <branch or commit>
-
-### <file>
-
-<node>:L<start>-<end>
-  [bloat-hunter]  <finding or "No issues.">
-  [edge-case-hunter]  <finding or "No issues.">
-
----
-net: -<N> lines possible. totals: <X>🔴 <Y>🟡 <Z>🔵
-```
-
-Preserve the exact lens tag format. Every finding needs a concrete line, failure mechanism, and fix.
-
-## Step 5: Be Direct
-
-Do not soften findings. If no issue exists, say so briefly.

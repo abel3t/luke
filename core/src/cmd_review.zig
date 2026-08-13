@@ -5,10 +5,23 @@ const workspace_mod = @import("workspace.zig");
 const registry = @import("registry.zig");
 const cmd_init = @import("cmd_init.zig");
 
+fn commandSucceeded(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
 pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8, args: []const [:0]const u8) !void {
     if (args.len >= 4 and std.mem.eql(u8, args[2], "status")) return reviewStatus(allocator, io, home_dir, args[3]);
+    if (args.len >= 4 and std.mem.eql(u8, args[2], "next")) return reviewNext(allocator, io, home_dir, args[3]);
+    if (args.len >= 6 and std.mem.eql(u8, args[2], "submit")) return reviewSubmit(allocator, io, home_dir, args[3], args[4], args[5]);
+    if (args.len >= 5 and std.mem.eql(u8, args[2], "block")) return reviewBlock(allocator, io, home_dir, args[3], args[4]);
     if (args.len >= 4 and std.mem.eql(u8, args[2], "finalize")) return reviewFinalize(allocator, io, home_dir, args[3]);
-    if (args.len >= 5 and std.mem.eql(u8, args[2], "complete")) return reviewComplete(allocator, io, home_dir, args[3], args[4]);
+    if (args.len >= 5 and std.mem.eql(u8, args[2], "complete")) {
+        std.debug.print("`review complete` is retired; submit structured evidence with `review submit`.\n", .{});
+        return;
+    }
 
     const start_mode = args.len >= 3 and std.mem.eql(u8, args[2], "start");
     const review_args = if (start_mode) args[3..] else args[2..];
@@ -66,7 +79,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
             };
             defer allocator.free(result.stdout);
             defer allocator.free(result.stderr);
-            if (!result.term.success()) {
+            if (!commandSucceeded(result.term)) {
                 try err.interface.print("gh pr diff failed for {s}#{s}: {s}\n", .{ spec.repo, spec.pr, result.stderr });
                 try err.flush();
                 continue;
@@ -163,50 +176,22 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     var chunks = try planReviewChunks(allocator, diff_output, &knowledge_graph);
     defer deinitChunks(allocator, &chunks);
 
-    if (start_mode) {
-        const run_id = try saveReviewManifest(allocator, io, home_dir, &chunks);
-        defer allocator.free(run_id);
-        try err.interface.print("Review run created: {s}. Use `luke review status {s}`.\n", .{ run_id, run_id });
-        try err.flush();
-    }
+    // A review is always manifest-backed. Full chunk payloads stay on disk and
+    // are exposed only through `review next`, preventing context-sized dumps.
+    const run_id = try saveReviewManifest(allocator, io, home_dir, &chunks);
+    defer allocator.free(run_id);
 
     var eligible_lines: u64 = 0;
     for (chunks.items) |chunk| {
         for (chunk.changed_ranges.items) |range| eligible_lines += range.count;
     }
 
-    try out.interface.print("{{\n  \"coverage\": {{\n", .{});
-    try out.interface.print("    \"eligible_changed_lines\": {d},\n", .{eligible_lines});
-    try out.interface.print("    \"assigned_changed_lines\": {d},\n", .{eligible_lines});
-    try out.interface.print("    \"uncovered_changed_lines\": 0,\n", .{});
-    try out.interface.print("    \"chunks\": {d}\n", .{chunks.items.len});
-    try out.interface.print("  }},\n  \"chunks\": [\n", .{});
-
-    for (chunks.items, 0..) |chunk, i| {
-        if (i > 0) try out.interface.print(",\n", .{});
-        try out.interface.print("    {{\n      \"file\": ", .{});
-        try writeJsonString(&out.interface, chunk.file);
-        try out.interface.print(",\n      \"node\": ", .{});
-        try writeJsonString(&out.interface, chunk.node);
-        try out.interface.print(",\n      \"type\": ", .{});
-        try writeJsonString(&out.interface, @tagName(chunk.node_type));
-        try out.interface.print(",\n      \"start_line\": {d},\n      \"end_line\": {d},\n", .{ chunk.start_line, chunk.end_line });
-        try out.interface.print("      \"changed_ranges\": [", .{});
-        for (chunk.changed_ranges.items, 0..) |range, range_i| {
-            if (range_i > 0) try out.interface.print(", ", .{});
-            try out.interface.print("{{ \"start\": {d}, \"end\": {d} }}", .{ range.start_line, range.end_line });
-        }
-        try out.interface.print("],\n      \"review_lenses\": [\n", .{});
-
-        var first_lens = true;
-        for (review_lenses) |lens| {
-            if (shouldUseLens(chunk.file, lens)) try writeLens(&out.interface, &first_lens, lens);
-        }
-        try out.interface.print("\n      ]\n    }}", .{});
-    }
-
-    try out.interface.print("\n  ]\n}}\n", .{});
+    try out.interface.print("{{\n  \"run_id\": ", .{});
+    try writeJsonString(&out.interface, run_id);
+    try out.interface.print(",\n  \"coverage\": {{\n    \"eligible_changed_lines\": {d},\n    \"assigned_changed_lines\": {d},\n    \"uncovered_changed_lines\": 0,\n    \"chunks\": {d}\n  }},\n  \"state\": \"planned\",\n  \"next\": \"luke review next {s}\"\n}}\n", .{ eligible_lines, eligible_lines, chunks.items.len, run_id });
     try out.flush();
+    try err.interface.print("Review run created: {s}. Chunks are retained in the manifest; use `review next`.\n", .{run_id});
+    try err.flush();
 }
 
 const ChangedRange = struct {
@@ -250,10 +235,11 @@ fn planReviewChunks(allocator: std.mem.Allocator, diff_output: []const u8, knowl
 
         var matched: ?*ReviewChunk = null;
         for (chunks.items) |*chunk| {
-            if (std.mem.eql(u8, chunk.file, chunk_file) and
+            const same_lockfile_unit = isLockfile(chunk_file) and std.mem.eql(u8, chunk.file, chunk_file);
+            if (same_lockfile_unit or (std.mem.eql(u8, chunk.file, chunk_file) and
                 std.mem.eql(u8, chunk.node, chunk_name) and
                 chunk.start_line == chunk_start and
-                chunk.end_line == chunk_end)
+                chunk.end_line == chunk_end))
             {
                 matched = chunk;
                 break;
@@ -262,15 +248,19 @@ fn planReviewChunks(allocator: std.mem.Allocator, diff_output: []const u8, knowl
 
         if (matched) |chunk| {
             try chunk.changed_ranges.append(allocator, range);
+            if (isLockfile(chunk_file)) {
+                chunk.start_line = @min(chunk.start_line, range.start_line);
+                chunk.end_line = @max(chunk.end_line, range.end_line);
+            }
         } else {
             var ranges = std.ArrayList(ChangedRange).empty;
             try ranges.append(allocator, range);
             try chunks.append(allocator, .{
                 .file = chunk_file,
-                .node = chunk_name,
+                .node = if (isLockfile(chunk_file)) "dependency lockfile" else chunk_name,
                 .node_type = chunk_type,
-                .start_line = chunk_start,
-                .end_line = chunk_end,
+                .start_line = if (isLockfile(chunk_file)) range.start_line else chunk_start,
+                .end_line = if (isLockfile(chunk_file)) range.end_line else chunk_end,
                 .changed_ranges = ranges,
             });
         }
@@ -318,6 +308,71 @@ fn reviewManifestPath(allocator: std.mem.Allocator, home_dir: []const u8, run_id
     return std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.json", .{ home_dir, run_id });
 }
 
+// `mkdir` is atomic: only one CLI process can own a run lock at a time.
+// The owner PID makes crash leftovers recoverable without stealing a live lock.
+fn acquireReviewLock(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) ![]const u8 {
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.lock", .{ home_dir, run_id });
+    errdefer allocator.free(lock_path);
+    for (0..2) |_| {
+        const mkdir_result = try std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", lock_path } });
+        defer allocator.free(mkdir_result.stdout);
+        defer allocator.free(mkdir_result.stderr);
+        if (commandSucceeded(mkdir_result.term)) {
+            const owner_path = try std.fmt.allocPrint(allocator, "{s}/owner", .{lock_path});
+            defer allocator.free(owner_path);
+            var owner = try std.Io.Dir.createFileAbsolute(io, owner_path, .{});
+            defer owner.close(io);
+            var buf: [32]u8 = undefined;
+            const owner_text = try std.fmt.bufPrint(&buf, "{d}\n", .{std.c.getpid()});
+            try owner.writeStreamingAll(io, owner_text);
+            return lock_path;
+        }
+
+        const owner_path = try std.fmt.allocPrint(allocator, "{s}/owner", .{lock_path});
+        defer allocator.free(owner_path);
+        const owner_result = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "cat", owner_path } }) catch return error.ReviewRunBusy;
+        defer allocator.free(owner_result.stdout);
+        defer allocator.free(owner_result.stderr);
+        const pid = std.fmt.parseInt(i32, std.mem.trim(u8, owner_result.stdout, " \n\r\t"), 10) catch {
+            const cleanup = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "rm", "-rf", lock_path } }) catch return error.ReviewRunBusy;
+            allocator.free(cleanup.stdout);
+            allocator.free(cleanup.stderr);
+            continue;
+        };
+        var pid_buf: [32]u8 = undefined;
+        const pid_text = try std.fmt.bufPrint(&pid_buf, "{d}", .{pid});
+        const alive = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "kill", "-0", pid_text } }) catch return error.ReviewRunBusy;
+        defer allocator.free(alive.stdout);
+        defer allocator.free(alive.stderr);
+        if (commandSucceeded(alive.term)) return error.ReviewRunBusy;
+        const cleanup = try std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "rm", "-rf", lock_path } });
+        defer allocator.free(cleanup.stdout);
+        defer allocator.free(cleanup.stderr);
+        if (!commandSucceeded(cleanup.term)) return error.ReviewRunBusy;
+    }
+    return error.ReviewRunBusy;
+}
+
+fn releaseReviewLock(allocator: std.mem.Allocator, io: std.Io, lock_path: []const u8) void {
+    const result = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "rm", "-rf", lock_path } }) catch return;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+}
+
+fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, content: []const u8) !void {
+    const path = try reviewManifestPath(allocator, home_dir, run_id);
+    defer allocator.free(path);
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp);
+    var file = try std.Io.Dir.createFileAbsolute(io, tmp, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
+    const result = try std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mv", "-f", tmp, path } });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (!commandSucceeded(result.term)) return error.ManifestWriteFailed;
+}
+
 fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, chunks: *std.ArrayList(ReviewChunk)) ![]const u8 {
     const run_id = try std.fmt.allocPrint(allocator, "review-{d}", .{std.c.getpid()});
     errdefer allocator.free(run_id);
@@ -340,7 +395,21 @@ fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, home_dir: []cons
         try writeJsonString(&writer.interface, chunk.file);
         try writer.interface.print(", \"node\": ", .{});
         try writeJsonString(&writer.interface, chunk.node);
-        try writer.interface.print(", \"start_line\": {d}, \"end_line\": {d} }}", .{ chunk.start_line, chunk.end_line });
+        try writer.interface.print(", \"type\": ", .{});
+        try writeJsonString(&writer.interface, @tagName(chunk.node_type));
+        try writer.interface.print(", \"start_line\": {d}, \"end_line\": {d}, \"changed_ranges\": [", .{ chunk.start_line, chunk.end_line });
+        for (chunk.changed_ranges.items, 0..) |range, range_index| {
+            if (range_index > 0) try writer.interface.print(", ", .{});
+            try writer.interface.print("{{\"start\":{d},\"end\":{d}}}", .{ range.start_line, range.end_line });
+        }
+        try writer.interface.print("], \"review_lenses\": [", .{});
+        var first_lens = true;
+        for (review_lenses) |lens| if (shouldUseLens(chunk.file, lens)) {
+            if (!first_lens) try writer.interface.print(", ", .{});
+            first_lens = false;
+            try writeJsonString(&writer.interface, lens);
+        };
+        try writer.interface.print("] }}", .{});
     }
     try writer.interface.print("\n  ]\n}}\n", .{});
     try writer.flush();
@@ -352,7 +421,7 @@ fn readReviewManifest(allocator: std.mem.Allocator, io: std.Io, home_dir: []cons
     defer allocator.free(path);
     var dir = try std.Io.Dir.openDirAbsolute(io, std.fs.path.dirname(path).?, .{});
     defer dir.close(io);
-    return dir.readFileAlloc(io, std.fs.path.basename(path), allocator, @fromBackingInt(@intCast(1024 * 1024)));
+    return dir.readFileAlloc(io, std.fs.path.basename(path), allocator, .limited(1024 * 1024));
 }
 
 fn reviewStatus(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) !void {
@@ -362,21 +431,29 @@ fn reviewStatus(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, 
     };
     defer allocator.free(content);
     const pending = countOccurrences(content, "\"status\": \"pending\"");
+    const claimed = countOccurrences(content, "\"status\": \"claimed\"");
     const complete = countOccurrences(content, "\"status\": \"complete\"");
-    const failed = countOccurrences(content, "\"status\": \"failed\"");
-    std.debug.print("Review {s}: {d} complete, {d} pending, {d} failed\n", .{ run_id, complete, pending, failed });
+    const blocked = countOccurrences(content, "\"status\": \"blocked\"");
+    std.debug.print("Review {s}: {d} complete, {d} pending, {d} claimed, {d} blocked\n", .{ run_id, complete, pending, claimed, blocked });
 }
 
 fn reviewFinalize(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) !void {
+    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+        std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
+        return;
+    };
+    defer allocator.free(lock);
+    defer releaseReviewLock(allocator, io, lock);
     const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
     defer allocator.free(content);
     const pending = countOccurrences(content, "\"status\": \"pending\"");
-    const failed = countOccurrences(content, "\"status\": \"failed\"");
-    if (pending != 0 or failed != 0) {
-        std.debug.print("Review incomplete: {d} pending, {d} failed.\n", .{ pending, failed });
+    const claimed = countOccurrences(content, "\"status\": \"claimed\"");
+    const blocked = countOccurrences(content, "\"status\": \"blocked\"");
+    if (pending != 0 or claimed != 0 or blocked != 0) {
+        std.debug.print("Review incomplete: {d} pending, {d} claimed, {d} blocked. Run data retained.\n", .{ pending, claimed, blocked });
         return;
     }
     const path = try reviewManifestPath(allocator, home_dir, run_id);
@@ -385,38 +462,197 @@ fn reviewFinalize(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8
     std.debug.print("Review complete: all chunks have terminal success status. Cleared run data.\n", .{});
 }
 
-fn reviewComplete(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, chunk_id: []const u8) !void {
+fn reviewNext(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) !void {
+    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+        std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
+        return;
+    };
+    defer allocator.free(lock);
+    defer releaseReviewLock(allocator, io, lock);
+    const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
+        std.debug.print("Review run not found: {s}\n", .{run_id});
+        return;
+    };
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+        std.debug.print("Review manifest is invalid JSON.\n", .{});
+        return;
+    };
+    defer parsed.deinit();
+    const chunks_value = parsed.value.object.get("chunks") orelse return error.InvalidReviewManifest;
+    if (chunks_value != .array) return error.InvalidReviewManifest;
+    for (chunks_value.array.items) |chunk| {
+        if (chunk != .object) continue;
+        const status = chunk.object.get("status") orelse continue;
+        if (status != .string or !std.mem.eql(u8, status.string, "pending")) continue;
+        const id = chunk.object.get("id") orelse return error.InvalidReviewManifest;
+        if (id != .integer) return error.InvalidReviewManifest;
+        try claimChunk(allocator, io, home_dir, run_id, @intCast(id.integer));
+        var stdout_buf: [8192]u8 = undefined;
+        var out = std.Io.File.Writer.init(std.Io.File.stdout(), io, &stdout_buf);
+        try out.interface.print("{{\"run_id\":", .{});
+        try writeJsonString(&out.interface, run_id);
+        try out.interface.print(",\"chunk\":", .{});
+        try out.interface.print("{f}", .{std.json.fmt(chunk, .{})});
+        try out.interface.print("}}\n", .{});
+        try out.flush();
+        return;
+    }
+    std.debug.print("No pending chunks for {s}.\n", .{run_id});
+}
+
+fn reviewSubmit(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, chunk_id: []const u8, result_path: []const u8) !void {
     const index = std.fmt.parseInt(usize, chunk_id, 10) catch {
         std.debug.print("Chunk id must be a number.\n", .{});
         return;
     };
+    const result = std.Io.Dir.cwd().readFileAlloc(io, result_path, allocator, @enumFromInt(1024 * 1024)) catch {
+        std.debug.print("Cannot read review result: {s}\n", .{result_path});
+        return;
+    };
+    defer allocator.free(result);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch {
+        std.debug.print("Review result must be valid JSON.\n", .{});
+        return;
+    };
+    defer parsed.deinit();
+    if (!isValidSubmission(parsed.value)) {
+        std.debug.print("Review result requires acknowledged_ranges and findings with line, severity, mechanism, and fix.\n", .{});
+        return;
+    }
+    const manifest = readReviewManifest(allocator, io, home_dir, run_id) catch {
+        std.debug.print("Review run not found: {s}\n", .{run_id});
+        return;
+    };
+    defer allocator.free(manifest);
+    var manifest_json = std.json.parseFromSlice(std.json.Value, allocator, manifest, .{}) catch return error.InvalidReviewManifest;
+    defer manifest_json.deinit();
+    const chunks = manifest_json.value.object.get("chunks") orelse return error.InvalidReviewManifest;
+    if (chunks != .array or index >= chunks.array.items.len or chunks.array.items[index] != .object) {
+        std.debug.print("Chunk {d} not found.\n", .{index});
+        return;
+    }
+    if (!submissionMatchesChunk(parsed.value, chunks.array.items[index])) {
+        std.debug.print("Submission must acknowledge every assigned range; finding lines must be assigned to this chunk.\n", .{});
+        return;
+    }
+    try recordSubmission(allocator, io, home_dir, run_id, index, result);
+}
+
+fn isValidSubmission(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const acknowledged = value.object.get("acknowledged_ranges") orelse return false;
+    const findings = value.object.get("findings") orelse return false;
+    if (acknowledged != .array or findings != .array) return false;
+    for (findings.array.items) |finding| {
+        if (finding != .object) return false;
+        const line = finding.object.get("line") orelse return false;
+        const severity = finding.object.get("severity") orelse return false;
+        const mechanism = finding.object.get("mechanism") orelse return false;
+        const fix = finding.object.get("fix") orelse return false;
+        if (line != .integer or severity != .string or mechanism != .string or fix != .string) return false;
+    }
+    return true;
+}
+
+fn submissionMatchesChunk(submission: std.json.Value, chunk: std.json.Value) bool {
+    const acknowledged = submission.object.get("acknowledged_ranges") orelse return false;
+    const ranges = chunk.object.get("changed_ranges") orelse return false;
+    if (acknowledged != .array or ranges != .array or acknowledged.array.items.len != ranges.array.items.len) return false;
+    for (ranges.array.items, 0..) |range, i| {
+        if (range != .object or acknowledged.array.items[i] != .object) return false;
+        const expected_start = range.object.get("start") orelse return false;
+        const expected_end = range.object.get("end") orelse return false;
+        const actual_start = acknowledged.array.items[i].object.get("start") orelse return false;
+        const actual_end = acknowledged.array.items[i].object.get("end") orelse return false;
+        if (expected_start != .integer or expected_end != .integer or actual_start != .integer or actual_end != .integer or expected_start.integer != actual_start.integer or expected_end.integer != actual_end.integer) return false;
+    }
+    const findings = submission.object.get("findings") orelse return false;
+    for (findings.array.items) |finding| {
+        const line = finding.object.get("line") orelse return false;
+        if (line != .integer or line.integer < 0) return false;
+        var in_assigned_range = false;
+        for (ranges.array.items) |range| {
+            const start = range.object.get("start").?.integer;
+            const end = range.object.get("end").?.integer;
+            if (line.integer >= start and line.integer <= end) in_assigned_range = true;
+        }
+        if (!in_assigned_range) return false;
+    }
+    return true;
+}
+
+fn claimChunk(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, index: usize) !void {
+    const content = try readReviewManifest(allocator, io, home_dir, run_id);
+    defer allocator.free(content);
+    const marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"pending\"", .{index});
+    defer allocator.free(marker);
+    const pos = std.mem.indexOf(u8, content, marker) orelse return error.ChunkAlreadyClaimed;
+    var next = std.ArrayList(u8).empty;
+    defer next.deinit(allocator);
+    const claimed_marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"claimed\", \"claimed_pid\": {d}", .{ index, std.c.getpid() });
+    defer allocator.free(claimed_marker);
+    try next.appendSlice(allocator, content[0..pos]);
+    try next.appendSlice(allocator, claimed_marker);
+    try next.appendSlice(allocator, content[pos + marker.len..]);
+    try writeManifestAtomic(allocator, io, home_dir, run_id, next.items);
+}
+
+fn reviewBlock(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, chunk_id: []const u8) !void {
+    const index = std.fmt.parseInt(usize, chunk_id, 10) catch return;
+    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+        std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
+        return;
+    };
+    defer allocator.free(lock);
+    defer releaseReviewLock(allocator, io, lock);
+    const content = readReviewManifest(allocator, io, home_dir, run_id) catch return;
+    defer allocator.free(content);
+    const marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"claimed\"", .{index});
+    defer allocator.free(marker);
+    const pos = std.mem.indexOf(u8, content, marker) orelse return;
+    var next = std.ArrayList(u8).empty;
+    defer next.deinit(allocator);
+    try next.appendSlice(allocator, content[0..pos]);
+    const blocked = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"blocked\"", .{index});
+    defer allocator.free(blocked);
+    try next.appendSlice(allocator, blocked);
+    try next.appendSlice(allocator, content[pos + marker.len..]);
+    try writeManifestAtomic(allocator, io, home_dir, run_id, next.items);
+    std.debug.print("Marked chunk {d} blocked.\n", .{index});
+}
+
+fn recordSubmission(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, index: usize, result: []const u8) !void {
+    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+        std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
+        return;
+    };
+    defer allocator.free(lock);
+    defer releaseReviewLock(allocator, io, lock);
     const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
     defer allocator.free(content);
 
-    const chunk_marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"pending\"", .{index});
+    const chunk_marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"claimed\"", .{index});
     defer allocator.free(chunk_marker);
     const chunk_pos = std.mem.indexOf(u8, content, chunk_marker) orelse {
         std.debug.print("Pending chunk {d} not found.\n", .{index});
         return;
     };
-    const marker = "\"status\": \"pending\"";
+    const marker = "\"status\": \"claimed\"";
     const pos = chunk_pos + std.mem.indexOf(u8, chunk_marker, marker).?;
 
     var next = std.ArrayList(u8).empty;
     defer next.deinit(allocator);
     try next.appendSlice(allocator, content[0..pos]);
-    try next.appendSlice(allocator, "\"status\": \"complete\"");
+    try next.appendSlice(allocator, "\"status\": \"complete\", \"result\": ");
+    try next.appendSlice(allocator, result);
     try next.appendSlice(allocator, content[pos + marker.len ..]);
 
-    const path = try reviewManifestPath(allocator, home_dir, run_id);
-    defer allocator.free(path);
-    var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, next.items);
-    std.debug.print("Marked chunk {d} complete.\n", .{index});
+    try writeManifestAtomic(allocator, io, home_dir, run_id, next.items);
+    std.debug.print("Recorded validated evidence for chunk {d}.\n", .{index});
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -549,6 +785,9 @@ fn hunkEndLine(start_line: u32, range: u32) u32 {
 }
 
 fn shouldUseLens(f_path: []const u8, agent: []const u8) bool {
+    // Generated resolution data is reviewed once through dependency integrity,
+    // never through source-code lenses per diff hunk.
+    if (isLockfile(f_path)) return std.mem.eql(u8, agent, "dependency-hunter");
     if (std.mem.eql(u8, agent, "bloat-hunter") or
         std.mem.eql(u8, agent, "edge-case-hunter") or
         std.mem.eql(u8, agent, "observability-hunter")) return true;
@@ -607,8 +846,16 @@ fn isConfig(f_path: []const u8) bool {
         std.mem.endsWith(u8, f_path, ".toml");
 }
 
+fn isLockfile(f_path: []const u8) bool {
+    return std.mem.endsWith(u8, f_path, "bun.lock") or
+        std.mem.endsWith(u8, f_path, "package-lock.json") or
+        std.mem.endsWith(u8, f_path, "pnpm-lock.yaml") or
+        std.mem.endsWith(u8, f_path, "yarn.lock") or
+        std.mem.endsWith(u8, f_path, "Cargo.lock");
+}
+
 fn isDeps(f_path: []const u8) bool {
-    return std.mem.endsWith(u8, f_path, "package.json") or
+    return isLockfile(f_path) or std.mem.endsWith(u8, f_path, "package.json") or
         std.mem.endsWith(u8, f_path, "go.mod") or
         std.mem.endsWith(u8, f_path, "go.sum") or
         std.mem.endsWith(u8, f_path, "Cargo.toml") or
@@ -670,6 +917,24 @@ test "review planner assigns every changed hunk to one smallest AST chunk" {
     try std.testing.expectEqual(@as(u32, 40), chunks.items[0].end_line);
     try std.testing.expectEqual(@as(u32, 3), chunks.items[0].changed_ranges.items[0].count);
     try std.testing.expectEqualStrings("Repository", chunks.items[1].node);
+}
+
+test "lockfiles are one dependency review unit" {
+    var knowledge_graph = graph.Graph.init(std.testing.allocator);
+    defer knowledge_graph.deinit();
+    const diff =
+        \\diff --git a/bun.lock b/bun.lock
+        \\+++ b/bun.lock
+        \\@@ -10 +10 @@
+        \\@@ -100,2 +100,2 @@
+    ;
+    var chunks = try planReviewChunks(std.testing.allocator, diff, &knowledge_graph);
+    defer deinitChunks(std.testing.allocator, &chunks);
+    try std.testing.expectEqual(@as(usize, 1), chunks.items.len);
+    try std.testing.expectEqualStrings("dependency lockfile", chunks.items[0].node);
+    try std.testing.expectEqual(@as(usize, 2), chunks.items[0].changed_ranges.items.len);
+    try std.testing.expect(shouldUseLens("bun.lock", "dependency-hunter"));
+    try std.testing.expect(!shouldUseLens("bun.lock", "bloat-hunter"));
 }
 
 test "review lens selection covers file classes" {

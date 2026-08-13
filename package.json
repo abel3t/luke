@@ -1,5 +1,6 @@
 {
 	"name": "luke-workspace",
+	"type": "module",
 	"private": true,
 	"keywords": [
 		"pi-package",
@@ -18,6 +19,7 @@
 		]
 	},
 	"scripts": {
+		"build": "cd core && zig build && cp zig-out/bin/core ../bin/luke",
 		"build:core": "cd core && zig build && cp zig-out/bin/core ../bin/luke",
 		"format": "biome format --write .",
 		"lint": "biome lint .",
