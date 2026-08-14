@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync as readFileSyncNode } from "node:fs";
+import { dirname, resolve, join } from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { orchestrateReview } from "./review-runner.js";
@@ -25,6 +26,38 @@ function splitArgs(text) {
 			.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)
 			?.map((part) => part.replace(/^(["'])(.*)\1$/, "$2")) || []
 	);
+}
+
+
+function getGlobalWorkspaceSlug(cwd) {
+	const workspacesDir = join(os.homedir(), ".luke", "workspaces");
+	if (!existsSync(workspacesDir)) return null;
+	const entries = readdirSync(workspacesDir, { withFileTypes: true });
+	for (const entry of entries) {
+		if (entry.isDirectory()) {
+			const wsJsonPath = join(workspacesDir, entry.name, "workspace.json");
+			if (existsSync(wsJsonPath)) {
+				try {
+					const ws = JSON.parse(readFileSyncNode(wsJsonPath, "utf8"));
+					if (ws.folders && ws.folders.some(f => cwd.startsWith(f.path))) {
+						return ws.slug;
+					}
+				} catch (e) {}
+			}
+		}
+	}
+	return null;
+}
+
+function checkWorkspace(ctx) {
+	const cwd = ctx?.cwd || process.cwd();
+	const slug = getGlobalWorkspaceSlug(cwd);
+	if (!slug) {
+		const msg = "Not a registered LUKE workspace. Run 'luke workspace init' in the global registry.";
+		ctx?.ui?.notify?.(msg, "error");
+		throw new Error(msg);
+	}
+	return slug;
 }
 
 function runLuke(args, cwd, signal) {
@@ -80,6 +113,7 @@ async function runAutomatedReview(pi, args, ctx) {
 		return;
 	}
 	try {
+		checkWorkspace(ctx);
 		const result = await orchestrateReview({
 			lukeBin,
 			target,
@@ -120,6 +154,7 @@ async function runAutomatedTask(pi, args, ctx) {
 		return;
 	}
 	try {
+		checkWorkspace(ctx);
 		const result = await orchestrateTask({
 			target,
 			cwd: ctx?.cwd || process.cwd(),
@@ -208,6 +243,7 @@ export default function (pi) {
 			if (command === "query")
 				return sendSkill(pi, "luke-query", forwarded, ctx);
 			if (command === "audit") {
+				checkWorkspace(ctx);
 				const result = await runLuke(["audit"], ctx?.cwd || process.cwd());
 				pi.sendUserMessage(result.stdout || result.stderr, {
 					deliverAs: "followUp",
@@ -274,6 +310,8 @@ export default function (pi) {
 		}),
 		async execute(_toolCallId, params, signal) {
 			const cwd = params.cwd || process.cwd();
+			const slug = getGlobalWorkspaceSlug(cwd);
+			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace." }] };
 			const result = await runLuke(params.args || [], cwd, signal);
 			const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
 			return {
@@ -309,6 +347,9 @@ export default function (pi) {
 			specPath: Type.Optional(Type.String({ description: "Path to the SPEC.md file. Only used for 'create'." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const cwd = ctx?.cwd || process.cwd();
+			const slug = getGlobalWorkspaceSlug(cwd);
+			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace." }] };
 			if (params.subcommand === "create") {
 				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", `AI is requesting to physically create the Git Worktree for task ${params.taskId}. Allow?`);
 				if (!ok) {
@@ -325,7 +366,6 @@ export default function (pi) {
 			if (params.subcommand === "create" && params.specPath) {
 				args.push("--spec", params.specPath);
 			}
-			const cwd = ctx?.cwd || process.cwd();
 			const result = await runLuke(args, cwd, signal);
 			const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
 			return {

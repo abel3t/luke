@@ -7,27 +7,42 @@ pub const Storage = struct {
     luke_path: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8) !Storage {
-        _ = home_dir; // not used anymore, storage is strictly local
-        const is_absolute = std.fs.path.isAbsolute(workspace_path);
-        const absolute_workspace_path = if (is_absolute)
-            try allocator.dupe(u8, workspace_path)
-        else blk: {
-            const cwd = try std.process.currentPathAlloc(io, allocator);
-            defer allocator.free(cwd);
-            if (std.mem.eql(u8, workspace_path, ".")) {
-                break :blk try allocator.dupe(u8, cwd);
-            }
-            break :blk try std.fs.path.join(allocator, &[_][]const u8{ cwd, workspace_path });
-        };
-        defer allocator.free(absolute_workspace_path);
+        _ = workspace_path;
+        const cwd = try std.process.currentPathAlloc(io, allocator);
+        defer allocator.free(cwd);
 
-        const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{absolute_workspace_path});
-        
-        // Ensure .luke exists. If not, this is not a registered workspace.
-        var check_dir = std.Io.Dir.openDirAbsolute(io, luke_path, .{}) catch {
+        const workspaces_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces", .{home_dir});
+        defer allocator.free(workspaces_dir);
+
+        var dir = std.fs.openDirAbsolute(workspaces_dir, .{ .iterate = true }) catch return error.NotARegisteredWorkspace;
+        defer dir.close();
+
+        var slug: ?[]const u8 = null;
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind == .directory) {
+                const json_path = try std.fmt.allocPrint(allocator, "{s}/{s}/workspace.json", .{ workspaces_dir, entry.name });
+                defer allocator.free(json_path);
+                
+                const file = std.fs.openFileAbsolute(json_path, .{}) catch continue;
+                defer file.close();
+                
+                const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
+                defer allocator.free(content);
+                
+                if (std.mem.indexOf(u8, content, cwd) != null) {
+                    slug = try allocator.dupe(u8, entry.name);
+                    break;
+                }
+            }
+        }
+
+        if (slug == null) {
             return error.NotARegisteredWorkspace;
-        };
-        check_dir.close(io);
+        }
+
+        const luke_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspaces_dir, slug.? });
+        allocator.free(slug.?);
 
         return .{ .allocator = allocator, .io = io, .luke_path = luke_path };
     }
