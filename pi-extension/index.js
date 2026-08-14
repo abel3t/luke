@@ -371,7 +371,7 @@ export default function (pi) {
 			const slug = getGlobalWorkspaceSlug(cwd);
 			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace. You MUST call the 'luke-init' skill first." }] };
 			if (params.subcommand === "create") {
-				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", `AI is requesting to physically create the Git Worktree for task ${params.taskId}. Allow?`);
+				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", `AI is requesting to create the Pending task ${params.taskId}. Allow?`);
 				if (!ok) {
 					return { content: [{ type: "text", text: "Task creation aborted by user." }] };
 				}

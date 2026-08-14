@@ -101,31 +101,6 @@ fn handleCreate(allocator: std.mem.Allocator, io: std.Io, workspace_path: []cons
     }
     const task_id = args[0];
     
-    const root_worktree = try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{luke_path, task_id});
-    defer allocator.free(root_worktree);
-    
-    // Create root directory so sub-worktrees have a place to live even if root is not a repo
-    _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"mkdir", "-p", root_worktree} }) catch {};
-    
-    const branch_name = try std.fmt.allocPrint(allocator, "luke/{s}", .{task_id});
-    defer allocator.free(branch_name);
-    
-    const repos = try getRepoPaths(allocator, io, workspace_path);
-    defer {
-        for (repos) |repo| allocator.free(repo);
-        allocator.free(repos);
-    }
-    
-    for (repos) |repo_path| {
-        const rel_path = if (std.mem.eql(u8, repo_path, workspace_path)) "" else repo_path[workspace_path.len + 1 ..];
-        const dest = if (rel_path.len == 0) try allocator.dupe(u8, root_worktree) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{root_worktree, rel_path});
-        defer allocator.free(dest);
-        
-        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"git", "-C", repo_path, "worktree", "add", "-b", branch_name, dest} }) catch {
-            std.debug.print("Note: Could not create git worktree for {s}.\n", .{repo_path});
-        };
-    }
-    
     const task_dir = try std.fmt.allocPrint(allocator, "{s}/tasks/{s}", .{luke_path, task_id});
     defer allocator.free(task_dir);
     _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", task_dir } }) catch {};
@@ -226,6 +201,53 @@ fn handleStateChange(allocator: std.mem.Allocator, io: std.Io, workspace_path: [
     state_file.close(io);
     
     std.debug.print("Task {s} status updated to {s}\n", .{task_id, @tagName(new_status)});
+    
+    if (new_status == .InProgress) {
+        std.debug.print("Creating worktree for task {s}...\n", .{task_id});
+        
+        const root_worktree = try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{luke_path, task_id});
+        defer allocator.free(root_worktree);
+        
+        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"mkdir", "-p", root_worktree} }) catch {};
+        
+        const branch_name = try std.fmt.allocPrint(allocator, "luke/{s}", .{task_id});
+        defer allocator.free(branch_name);
+        
+        const repos = try getRepoPaths(allocator, io, workspace_path);
+        defer {
+            for (repos) |repo| allocator.free(repo);
+            allocator.free(repos);
+        }
+        
+        for (repos) |repo_path| {
+            const rel_path = if (std.mem.eql(u8, repo_path, workspace_path)) "" else repo_path[workspace_path.len + 1 ..];
+            const dest = if (rel_path.len == 0) try allocator.dupe(u8, root_worktree) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{root_worktree, rel_path});
+            defer allocator.free(dest);
+            
+            _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"git", "-C", repo_path, "worktree", "add", "-b", branch_name, dest} }) catch {
+                std.debug.print("Note: Could not create git worktree for {s}.\n", .{repo_path});
+            };
+        }
+    }
+    
+    if (new_status == .ReviewPending) {
+        std.debug.print("Auto-committing any untracked/modified files in worktree {s}...\n", .{task_id});
+        const root_worktree = try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{luke_path, task_id});
+        defer allocator.free(root_worktree);
+        const repos = try getRepoPaths(allocator, io, workspace_path);
+        defer {
+            for (repos) |repo| allocator.free(repo);
+            allocator.free(repos);
+        }
+        for (repos) |repo_path| {
+            const rel_path = if (std.mem.eql(u8, repo_path, workspace_path)) "" else repo_path[workspace_path.len + 1 ..];
+            const dest = if (rel_path.len == 0) try allocator.dupe(u8, root_worktree) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{root_worktree, rel_path});
+            defer allocator.free(dest);
+            
+            _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"git", "-C", dest, "add", "-A"} }) catch {};
+            _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"git", "-C", dest, "commit", "-m", "Auto-commit before submit"} }) catch {};
+        }
+    }
     
     if (new_status == .Done or new_status == .Cancelled) {
         std.debug.print("Task folder retained until `luke task sweep`.\n", .{});
