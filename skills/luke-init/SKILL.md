@@ -13,7 +13,7 @@ When you are told "Not a registered LUKE workspace" or need to initialize a proj
 
 1. Register the workspace:
 ```bash
-luke workspace init <name>
+luke workspace init .
 ```
 
 2. Build the AST index:
@@ -22,5 +22,5 @@ luke index
 ```
 
 ## Rules
-- You MUST run `luke workspace init <name>` using bash. Provide a short slug-like name for the project.
+- You MUST run `luke workspace init .` using bash. This will automatically generate the correct project slug.
 - You MUST run `luke index` right after registering, otherwise the AST guard will block other tools.
