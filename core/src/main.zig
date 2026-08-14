@@ -29,19 +29,29 @@ pub fn main(init: std.process.Init) !void {
         const workspace_path = if (args.len > 2) args[2] else ".";
         try cmd_init.run(allocator, io, workspace_path, home_dir);
     } else if (std.mem.eql(u8, command, "workspace")) {
-        if (args.len < 4 or !std.mem.eql(u8, args[2], "init")) {
-            std.debug.print("Usage: luke workspace init <name>\n", .{});
+        if (args.len < 3 or !std.mem.eql(u8, args[2], "init")) {
+            std.debug.print("Usage: luke workspace init [name|.]\n", .{});
             return;
-        }
-        const name = args[3];
-        const slug = try allocator.dupe(u8, name);
-        for (slug) |*c| {
-            if (c.* == ' ') c.* = '-';
-            c.* = std.ascii.toLower(c.*);
         }
 
         const cwd = try std.process.currentPathAlloc(io, allocator);
         defer allocator.free(cwd);
+
+        var slug_buf: []u8 = undefined;
+        if (args.len > 3 and !std.mem.eql(u8, args[3], ".")) {
+            slug_buf = try allocator.dupe(u8, args[3]);
+        } else {
+            const basename = std.fs.path.basename(cwd);
+            const dirname = std.fs.path.dirname(cwd) orelse "";
+            const parent = std.fs.path.basename(dirname);
+            slug_buf = try std.fmt.allocPrint(allocator, "{s}-{s}", .{parent, basename});
+        }
+        for (slug_buf) |*c| {
+            if (c.* == ' ') c.* = '-';
+            c.* = std.ascii.toLower(c.*);
+        }
+        const slug = slug_buf;
+        const name = slug;
 
         const workspaces_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces/{s}", .{home_dir, slug});
         defer allocator.free(workspaces_dir);

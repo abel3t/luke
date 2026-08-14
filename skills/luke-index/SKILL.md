@@ -12,15 +12,14 @@ Rebuild the Luke AST knowledge graph for the current workspace.
 Run from the root of your repository:
 
 ```bash
-luke workspace init .
-luke index .
+luke index
 ```
 
-Luke operates purely on a local-first principle. One `.luke` directory per repository. It does not use any global registry anymore.
+Luke operates using a global registry. Workspaces are registered in `~/.luke/workspaces/`.
 
 ## Rules
 
 - Use this when the user asks to index, re-index, rescan, refresh Luke, or rebuild the knowledge graph.
-- Indexing is completely local to the `.luke` boundary.
-- If `.luke` is missing, you must run `luke workspace init .` before indexing.
+- Indexing reads the global registry to find the workspace context.
+- If the workspace is not registered, you must run `luke workspace init <name>` before indexing.
 - Keep output short: report parsed file count and saved index path if available.

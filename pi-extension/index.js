@@ -203,7 +203,7 @@ export default function (pi) {
 				if (!slug) {
 					return {
 						block: true,
-						reason: "Not a registered LUKE workspace. You MUST run 'luke workspace init <name>' first.",
+						reason: "Not a registered LUKE workspace. You MUST call the 'luke-init' skill first.",
 					};
 				}
 				if (!cmd.includes("luke index") && !cmd.includes("luke init")) {
@@ -211,7 +211,7 @@ export default function (pi) {
 					if (!existsSync(astPath)) {
 						return {
 							block: true,
-							reason: `LUKE workspace '${slug}' is registered but AST index is missing. You MUST run 'luke index .' first.`,
+							reason: `LUKE workspace '${slug}' is registered but AST index is missing. You MUST call the 'luke-init' skill first.`,
 						};
 					}
 				}
@@ -283,6 +283,7 @@ export default function (pi) {
 
 	for (const [name, skill] of [
 		["luke-help", "luke-help"],
+		["luke-init", "luke-init"],
 		["luke-load", "luke-load"],
 		["luke-index", "luke-index"],
 		["luke-query", "luke-query"],
@@ -330,7 +331,7 @@ export default function (pi) {
 		async execute(_toolCallId, params, signal) {
 			const cwd = params.cwd || process.cwd();
 			const slug = getGlobalWorkspaceSlug(cwd);
-			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace." }] };
+			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace. You MUST call the 'luke-init' skill first." }] };
 			const result = await runLuke(params.args || [], cwd, signal);
 			const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
 			return {
@@ -368,7 +369,7 @@ export default function (pi) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const cwd = ctx?.cwd || process.cwd();
 			const slug = getGlobalWorkspaceSlug(cwd);
-			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace." }] };
+			if (!slug) return { content: [{ type: "text", text: "Not a registered LUKE workspace. You MUST call the 'luke-init' skill first." }] };
 			if (params.subcommand === "create") {
 				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", `AI is requesting to physically create the Git Worktree for task ${params.taskId}. Allow?`);
 				if (!ok) {
