@@ -12,11 +12,18 @@ fn commandSucceeded(term: std.process.Child.Term) bool {
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8, args: []const [:0]const u8) !void {
-    if (args.len >= 4 and std.mem.eql(u8, args[2], "status")) return reviewStatus(allocator, io, home_dir, args[3]);
-    if (args.len >= 4 and std.mem.eql(u8, args[2], "next")) return reviewNext(allocator, io, home_dir, args[3]);
-    if (args.len >= 6 and std.mem.eql(u8, args[2], "submit")) return reviewSubmit(allocator, io, home_dir, args[3], args[4], args[5]);
-    if (args.len >= 5 and std.mem.eql(u8, args[2], "block")) return reviewBlock(allocator, io, home_dir, args[3], args[4]);
-    if (args.len >= 4 and std.mem.eql(u8, args[2], "finalize")) return reviewFinalize(allocator, io, home_dir, args[3]);
+    var app_store = storage.Storage.init(allocator, io, workspace_path, home_dir) catch |err| {
+        std.debug.print("Error: Not a LUKE workspace. You MUST call the 'luke-init' skill first. {}\n", .{err});
+        return;
+    };
+    defer app_store.deinit();
+    const luke_path = app_store.luke_path;
+
+    if (args.len >= 4 and std.mem.eql(u8, args[2], "status")) return reviewStatus(allocator, io, luke_path, args[3]);
+    if (args.len >= 4 and std.mem.eql(u8, args[2], "next")) return reviewNext(allocator, io, luke_path, args[3]);
+    if (args.len >= 6 and std.mem.eql(u8, args[2], "submit")) return reviewSubmit(allocator, io, luke_path, args[3], args[4], args[5]);
+    if (args.len >= 5 and std.mem.eql(u8, args[2], "block")) return reviewBlock(allocator, io, luke_path, args[3], args[4]);
+    if (args.len >= 4 and std.mem.eql(u8, args[2], "finalize")) return reviewFinalize(allocator, io, luke_path, args[3]);
     if (args.len >= 5 and std.mem.eql(u8, args[2], "complete")) {
         std.debug.print("`review complete` is retired; submit structured evidence with `review submit`.\n", .{});
         return;
@@ -126,7 +133,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
 
     // A review is always manifest-backed. Full chunk payloads stay on disk and
     // are exposed only through `review next`, preventing context-sized dumps.
-    const run_id = try saveReviewManifest(allocator, io, cwd, &chunks);
+    const run_id = try saveReviewManifest(allocator, io, luke_path, &chunks);
     defer allocator.free(run_id);
 
     var eligible_lines: u64 = 0;
@@ -252,17 +259,17 @@ fn smallestCoveringNode(knowledge_graph: *graph.Graph, file: []const u8, range: 
     return best;
 }
 
-fn reviewManifestPath(allocator: std.mem.Allocator, cwd: []const u8, run_id: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.json", .{ cwd, run_id });
+fn reviewManifestPath(allocator: std.mem.Allocator, luke_path: []const u8, run_id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/reviews/{s}.json", .{ luke_path, run_id });
 }
 
 // `mkdir` is atomic: only one CLI process can own a run lock at a time.
 // The owner PID makes crash leftovers recoverable without stealing a live lock.
-fn acquireReviewLock(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) ![]const u8 {
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.lock", .{ cwd, run_id });
+fn acquireReviewLock(allocator: std.mem.Allocator, io: std.Io, luke_path: []const u8, run_id: []const u8) ![]const u8 {
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}/reviews/{s}.lock", .{ luke_path, run_id });
     errdefer allocator.free(lock_path);
     for (0..2) |_| {
-        const mkdir_result = try std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", lock_path } });
+        const mkdir_result = try std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", lock_path } });
         defer allocator.free(mkdir_result.stdout);
         defer allocator.free(mkdir_result.stderr);
         if (commandSucceeded(mkdir_result.term)) {
@@ -307,8 +314,8 @@ fn releaseReviewLock(allocator: std.mem.Allocator, io: std.Io, lock_path: []cons
     allocator.free(result.stderr);
 }
 
-fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8, content: []const u8) !void {
-    const path = try reviewManifestPath(allocator, cwd, run_id);
+fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, luke_path: []const u8, run_id: []const u8, content: []const u8) !void {
+    const path = try reviewManifestPath(allocator, luke_path, run_id);
     defer allocator.free(path);
     const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp);
@@ -321,14 +328,14 @@ fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8
     if (!commandSucceeded(result.term)) return error.ManifestWriteFailed;
 }
 
-fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, chunks: *std.ArrayList(ReviewChunk)) ![]const u8 {
+fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, luke_path: []const u8, chunks: *std.ArrayList(ReviewChunk)) ![]const u8 {
     const run_id = try std.fmt.allocPrint(allocator, "review-{d}", .{std.c.getpid()});
     errdefer allocator.free(run_id);
-    const reviews_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews", .{cwd});
+    const reviews_dir = try std.fmt.allocPrint(allocator, "{s}/reviews", .{luke_path});
     defer allocator.free(reviews_dir);
     _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", reviews_dir } }) catch {};
 
-    const path = try reviewManifestPath(allocator, cwd, run_id);
+    const path = try reviewManifestPath(allocator, luke_path, run_id);
     defer allocator.free(path);
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
@@ -364,8 +371,8 @@ fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8,
     return run_id;
 }
 
-fn readReviewManifest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) ![]u8 {
-    const path = try reviewManifestPath(allocator, cwd, run_id);
+fn readReviewManifest(allocator: std.mem.Allocator, io: std.Io, luke_path: []const u8, run_id: []const u8) ![]u8 {
+    const path = try reviewManifestPath(allocator, luke_path, run_id);
     defer allocator.free(path);
     var dir = try std.Io.Dir.openDirAbsolute(io, std.fs.path.dirname(path).?, .{});
     defer dir.close(io);

@@ -1,9 +1,13 @@
 const std = @import("std");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8, args: []const [:0]const u8) !void {
-    _ = home_dir;
-    const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{workspace_path});
-    defer allocator.free(luke_path);
+    const storage_mod = @import("storage.zig");
+    var storage = storage_mod.Storage.init(allocator, io, workspace_path, home_dir) catch |err| {
+        std.debug.print("Error: Not a LUKE workspace. You MUST call the 'luke-init' skill first. {}\n", .{err});
+        return;
+    };
+    defer storage.deinit();
+    const luke_path = storage.luke_path;
     if (args.len == 0) {
         std.debug.print("Usage: luke sweep <prepare|finalize> <task_id> [memory_string]\n", .{});
         return;

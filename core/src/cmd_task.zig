@@ -3,8 +3,6 @@ const std = @import("std");
 const TaskStatus = enum { Pending, InProgress, ReviewPending, Done, Cancelled };
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8, args: []const [:0]const u8) !void {
-    _ = home_dir;
-    
     if (args.len < 1) {
         std.debug.print("Usage: luke task <create|claim|submit|approve|reject|cancel> [args]\n", .{});
         return;
@@ -26,14 +24,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     };
     defer allocator.free(absolute_workspace_path);
     
-    const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{absolute_workspace_path});
-    defer allocator.free(luke_path);
-    
-    var check_dir = std.Io.Dir.openDirAbsolute(io, luke_path, .{}) catch {
-        std.debug.print("Error: Not a LUKE workspace. Run `luke workspace init .` first.\n", .{});
+    const storage_mod = @import("storage.zig");
+    var storage = storage_mod.Storage.init(allocator, io, absolute_workspace_path, home_dir) catch |err| {
+        std.debug.print("Error: Not a LUKE workspace. You MUST call the 'luke-init' skill first. {}\n", .{err});
         return;
     };
-    check_dir.close(io);
+    defer storage.deinit();
+    
+    const luke_path = storage.luke_path;
 
     if (std.mem.eql(u8, subcommand, "create")) {
         try handleCreate(allocator, io, absolute_workspace_path, luke_path, args[1..]);
@@ -53,6 +51,21 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
 }
 
 
+
+fn getRepoPaths(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8) ![][]const u8 {
+    var repos = std.ArrayList([]const u8).empty;
+    if (std.process.run(allocator, io, .{ .argv = &[_][]const u8{"find", workspace_path, "-maxdepth", "3", "-name", ".git", "-type", "d"} })) |res| {
+        defer allocator.free(res.stdout);
+        defer allocator.free(res.stderr);
+        var line_iter = std.mem.splitSequence(u8, res.stdout, "\n");
+        while (line_iter.next()) |line| {
+            if (line.len == 0) continue;
+            const repo_path = if (std.mem.endsWith(u8, line, "/.git")) line[0 .. line.len - 5] else line;
+            try repos.append(allocator, try allocator.dupe(u8, repo_path));
+        }
+    } else |_| {}
+    return repos.toOwnedSlice(allocator);
+}
 
 fn getRepoCommits(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, prefix: []const u8) ![]const u8 {
     var result_str = std.ArrayList(u8).empty;
@@ -91,12 +104,27 @@ fn handleCreate(allocator: std.mem.Allocator, io: std.Io, workspace_path: []cons
     const root_worktree = try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{luke_path, task_id});
     defer allocator.free(root_worktree);
     
+    // Create root directory so sub-worktrees have a place to live even if root is not a repo
+    _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"mkdir", "-p", root_worktree} }) catch {};
+    
     const branch_name = try std.fmt.allocPrint(allocator, "luke/{s}", .{task_id});
     defer allocator.free(branch_name);
     
-    _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"git", "-C", workspace_path, "worktree", "add", "-b", branch_name, root_worktree } }) catch {
-        std.debug.print("Note: Could not create git worktree automatically.\n", .{});
-    };
+    const repos = try getRepoPaths(allocator, io, workspace_path);
+    defer {
+        for (repos) |repo| allocator.free(repo);
+        allocator.free(repos);
+    }
+    
+    for (repos) |repo_path| {
+        const rel_path = if (std.mem.eql(u8, repo_path, workspace_path)) "" else repo_path[workspace_path.len + 1 ..];
+        const dest = if (rel_path.len == 0) try allocator.dupe(u8, root_worktree) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{root_worktree, rel_path});
+        defer allocator.free(dest);
+        
+        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{"git", "-C", repo_path, "worktree", "add", "-b", branch_name, dest} }) catch {
+            std.debug.print("Note: Could not create git worktree for {s}.\n", .{repo_path});
+        };
+    }
     
     const task_dir = try std.fmt.allocPrint(allocator, "{s}/tasks/{s}", .{luke_path, task_id});
     defer allocator.free(task_dir);
@@ -201,11 +229,44 @@ fn handleStateChange(allocator: std.mem.Allocator, io: std.Io, workspace_path: [
     
     if (new_status == .Done or new_status == .Cancelled) {
         std.debug.print("Task folder retained until `luke task sweep`.\n", .{});
-        if (new_status == .Done) {
-            std.debug.print("Remember to merge and remove the worktree: git worktree remove {s}/worktrees/{s}\n", .{luke_path, task_id});
-        } else {
-            _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "git", "-C", workspace_path, "worktree", "remove", "--force", try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{luke_path, task_id}) } }) catch {};
-            std.debug.print("Worktree removed.\n", .{});
+        
+        const root_worktree = try std.fmt.allocPrint(allocator, "{s}/worktrees/{s}", .{luke_path, task_id});
+        defer allocator.free(root_worktree);
+        const branch_name = try std.fmt.allocPrint(allocator, "luke/{s}", .{task_id});
+        defer allocator.free(branch_name);
+        
+        const repos = try getRepoPaths(allocator, io, workspace_path);
+        defer {
+            for (repos) |repo| allocator.free(repo);
+            allocator.free(repos);
         }
+        
+        for (repos) |repo_path| {
+            const rel_path = if (std.mem.eql(u8, repo_path, workspace_path)) "" else repo_path[workspace_path.len + 1 ..];
+            const dest = if (rel_path.len == 0) try allocator.dupe(u8, root_worktree) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{root_worktree, rel_path});
+            defer allocator.free(dest);
+            
+            if (new_status == .Done) {
+                std.debug.print("Merging branch {s} into {s}...\n", .{branch_name, repo_path});
+                const merge_res = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "git", "-C", repo_path, "merge", "--no-edit", branch_name } }) catch |err| {
+                    std.debug.print("[WARNING] Git merge failed for {s}: {}\n", .{repo_path, err});
+                    continue;
+                };
+                defer allocator.free(merge_res.stdout);
+                defer allocator.free(merge_res.stderr);
+                
+                if (merge_res.term != .exited or merge_res.term.exited != 0) {
+                    std.debug.print("[WARNING] Merge conflicts for {s}: {s}\nWorktree retained. Please resolve manually.\n", .{repo_path, merge_res.stderr});
+                } else {
+                    _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "git", "-C", repo_path, "worktree", "remove", "--force", dest } }) catch {};
+                    std.debug.print("Worktree removed for {s}.\n", .{repo_path});
+                }
+            } else {
+                _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "git", "-C", repo_path, "worktree", "remove", "--force", dest } }) catch {};
+                std.debug.print("Worktree removed for {s}.\n", .{repo_path});
+            }
+        }
+        
+        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "rm", "-rf", root_worktree } }) catch {};
     }
 }

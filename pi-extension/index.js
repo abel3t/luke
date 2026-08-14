@@ -240,7 +240,7 @@ export default function (pi) {
 		const isEditTool = event.toolName === "write_to_file" || event.toolName === "replace_file_content" || event.toolName === "edit_file";
 		if (isEditTool) {
 			const targetPath = event.input?.TargetFile || event.input?.path || "";
-			if (targetPath && !targetPath.includes(".luke/tasks/")) {
+			if (targetPath && !targetPath.includes(".luke/workspaces/")) {
 				return { block: true, reason: "FATAL: Code edits outside of a Task Worktree are strictly forbidden by LUKE Engine. You MUST use luke_task_engine to create a task first." };
 			}
 		}

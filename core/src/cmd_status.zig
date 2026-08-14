@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8, args: []const [:0]const u8) !void {
-    _ = home_dir;
     _ = args;
 
     // Convert relative workspace to absolute.
@@ -18,15 +17,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     };
     defer allocator.free(absolute_workspace_path);
 
-    const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{absolute_workspace_path});
-    defer allocator.free(luke_path);
-
-    // 1. Check if workspace is initialized
-    var luke_dir = std.Io.Dir.openDirAbsolute(io, luke_path, .{}) catch {
-        std.debug.print("Error: Not a LUKE workspace. No BRAIN.md found.\n", .{});
+    const storage_mod = @import("storage.zig");
+    var storage = storage_mod.Storage.init(allocator, io, absolute_workspace_path, home_dir) catch |err| {
+        std.debug.print("Error: Not a LUKE workspace. You MUST call the 'luke-init' skill first. {}\n", .{err});
         return;
     };
-    defer luke_dir.close(io);
+    defer storage.deinit();
+    const luke_path = storage.luke_path;
 
     // 2. Check for BRAIN.md at workspace root
     const brain_path = try std.fmt.allocPrint(allocator, "{s}/BRAIN.md", .{absolute_workspace_path});
