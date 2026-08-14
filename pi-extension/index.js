@@ -197,6 +197,25 @@ export default function (pi) {
 		const isBash = event.toolName === "bash" || event.toolName === "run_command";
 		if (isBash) {
 			const cmd = event.input?.command || event.input?.CommandLine || "";
+			if (cmd.includes("luke ") && !cmd.includes("luke workspace init")) {
+				const cwd = ctx?.cwd || process.cwd();
+				const slug = getGlobalWorkspaceSlug(cwd);
+				if (!slug) {
+					return {
+						block: true,
+						reason: "Not a registered LUKE workspace. You MUST run 'luke workspace init <name>' first.",
+					};
+				}
+				if (!cmd.includes("luke index") && !cmd.includes("luke init")) {
+					const astPath = join(os.homedir(), ".luke", "workspaces", slug, "ast.zon");
+					if (!existsSync(astPath)) {
+						return {
+							block: true,
+							reason: `LUKE workspace '${slug}' is registered but AST index is missing. You MUST run 'luke index .' first.`,
+						};
+					}
+				}
+			}
 			if (cmd.includes("luke task create")) {
 				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", "AI is attempting to create a task via bash. Allow?");
 				if (!ok) {

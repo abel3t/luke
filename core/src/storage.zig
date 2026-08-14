@@ -14,20 +14,21 @@ pub const Storage = struct {
         const workspaces_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces", .{home_dir});
         defer allocator.free(workspaces_dir);
 
-        var dir = std.fs.openDirAbsolute(workspaces_dir, .{ .iterate = true }) catch return error.NotARegisteredWorkspace;
-        defer dir.close();
+        var dir = std.Io.Dir.openDirAbsolute(io, workspaces_dir, .{ .iterate = true }) catch return error.NotARegisteredWorkspace;
+        defer dir.close(io);
 
         var slug: ?[]const u8 = null;
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             if (entry.kind == .directory) {
-                const json_path = try std.fmt.allocPrint(allocator, "{s}/{s}/workspace.json", .{ workspaces_dir, entry.name });
-                defer allocator.free(json_path);
+                const limit = @as(std.Io.Limit, @enumFromInt(1024 * 1024 * 5)); // 5MB limit for json
+                const subdir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspaces_dir, entry.name });
+                defer allocator.free(subdir_path);
                 
-                const file = std.fs.openFileAbsolute(json_path, .{}) catch continue;
-                defer file.close();
+                var subdir = std.Io.Dir.openDirAbsolute(io, subdir_path, .{}) catch continue;
+                defer subdir.close(io);
                 
-                const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
+                const content = subdir.readFileAlloc(io, "workspace.json", allocator, limit) catch continue;
                 defer allocator.free(content);
                 
                 if (std.mem.indexOf(u8, content, cwd) != null) {

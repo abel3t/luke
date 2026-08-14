@@ -29,29 +29,50 @@ pub fn main(init: std.process.Init) !void {
         const workspace_path = if (args.len > 2) args[2] else ".";
         try cmd_init.run(allocator, io, workspace_path, home_dir);
     } else if (std.mem.eql(u8, command, "workspace")) {
-        if (args.len < 3 or !std.mem.eql(u8, args[2], "init")) {
-            std.debug.print("Usage: luke workspace init <path>\n", .{});
+        if (args.len < 4 or !std.mem.eql(u8, args[2], "init")) {
+            std.debug.print("Usage: luke workspace init <name>\n", .{});
             return;
         }
-        const workspace_path = if (args.len > 3) args[3] else ".";
-        const is_absolute = std.fs.path.isAbsolute(workspace_path);
-        const absolute_workspace_path = if (is_absolute)
-            try allocator.dupe(u8, workspace_path)
-        else blk: {
-            const cwd = try std.process.currentPathAlloc(io, allocator);
-            defer allocator.free(cwd);
-            if (std.mem.eql(u8, workspace_path, ".")) {
-                break :blk try allocator.dupe(u8, cwd);
-            }
-            break :blk try std.fs.path.join(allocator, &[_][]const u8{ cwd, workspace_path });
-        };
-        defer allocator.free(absolute_workspace_path);
+        const name = args[3];
+        const slug = try allocator.dupe(u8, name);
+        for (slug) |*c| {
+            if (c.* == ' ') c.* = '-';
+            c.* = std.ascii.toLower(c.*);
+        }
+
+        const cwd = try std.process.currentPathAlloc(io, allocator);
+        defer allocator.free(cwd);
+
+        const workspaces_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces/{s}", .{home_dir, slug});
+        defer allocator.free(workspaces_dir);
+
+        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", workspaces_dir } }) catch {};
+
+        const json_path = try std.fmt.allocPrint(allocator, "{s}/workspace.json", .{workspaces_dir});
+        defer allocator.free(json_path);
+
+        var file = try std.Io.Dir.createFileAbsolute(io, json_path, .{});
+        defer file.close(io);
+
+        const json_content = try std.fmt.allocPrint(allocator,
+            \\{{
+            \\  "version": 1,
+            \\  "name": "{s}",
+            \\  "slug": "{s}",
+            \\  "folders": [
+            \\    {{ "name": "default", "path": "{s}" }}
+            \\  ]
+            \\}}
+            , .{ name, slug, cwd }
+        );
+        defer allocator.free(json_content);
+
+        var write_buf: [4096]u8 = undefined;
+        var writer = file.writer(io, &write_buf);
+        _ = try writer.interface.writeAll(json_content);
+        try writer.flush();
         
-        const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{absolute_workspace_path});
-        defer allocator.free(luke_path);
-        
-        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", luke_path } }) catch {};
-        std.debug.print("Workspace initialized in {s}\n", .{luke_path});
+        std.debug.print("Workspace '{s}' (slug: {s}) initialized globally for {s}\n", .{name, slug, cwd});
     } else if (std.mem.eql(u8, command, "query")) {
         if (args.len < 3) {
             std.debug.print("Error: query requires a target string.\n", .{});
