@@ -2,8 +2,10 @@ const std = @import("std");
 const cmd_init = @import("cmd_init.zig");
 const cmd_query = @import("cmd_query.zig");
 const cmd_review = @import("cmd_review.zig");
-const cmd_workspace = @import("cmd_workspace.zig");
 const cmd_audit = @import("cmd_audit.zig");
+const cmd_task = @import("cmd_task.zig");
+const cmd_sweep = @import("cmd_sweep.zig");
+const cmd_status = @import("cmd_status.zig");
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -23,24 +25,51 @@ pub fn main(init: std.process.Init) !void {
     const home_dir = init.minimal.environ.getAlloc(allocator, "HOME") catch try allocator.dupe(u8, ".");
     defer allocator.free(home_dir);
 
-    if (std.mem.eql(u8, command, "init")) {
+    if (std.mem.eql(u8, command, "index")) {
         const workspace_path = if (args.len > 2) args[2] else ".";
         try cmd_init.run(allocator, io, workspace_path, home_dir);
+    } else if (std.mem.eql(u8, command, "workspace")) {
+        if (args.len < 3 or !std.mem.eql(u8, args[2], "init")) {
+            std.debug.print("Usage: luke workspace init <path>\n", .{});
+            return;
+        }
+        const workspace_path = if (args.len > 3) args[3] else ".";
+        const is_absolute = std.fs.path.isAbsolute(workspace_path);
+        const absolute_workspace_path = if (is_absolute)
+            try allocator.dupe(u8, workspace_path)
+        else blk: {
+            const cwd = try std.process.currentPathAlloc(io, allocator);
+            defer allocator.free(cwd);
+            if (std.mem.eql(u8, workspace_path, ".")) {
+                break :blk try allocator.dupe(u8, cwd);
+            }
+            break :blk try std.fs.path.join(allocator, &[_][]const u8{ cwd, workspace_path });
+        };
+        defer allocator.free(absolute_workspace_path);
+        
+        const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{absolute_workspace_path});
+        defer allocator.free(luke_path);
+        
+        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", luke_path } }) catch {};
+        std.debug.print("Workspace initialized in {s}\n", .{luke_path});
     } else if (std.mem.eql(u8, command, "query")) {
         if (args.len < 3) {
             std.debug.print("Error: query requires a target string.\n", .{});
             return;
         }
-        const target = args[2];
-        try cmd_query.run(allocator, io, ".", home_dir, target);
+        try cmd_query.run(allocator, io, ".", home_dir, args[2..]);
     } else if (std.mem.eql(u8, command, "update")) {
         std.debug.print("Memory update command triggered.\n", .{});
     } else if (std.mem.eql(u8, command, "review")) {
         try cmd_review.run(allocator, io, ".", home_dir, args);
+    } else if (std.mem.eql(u8, command, "task")) {
+        try cmd_task.run(allocator, io, ".", home_dir, args[2..]);
+    } else if (std.mem.eql(u8, command, "sweep")) {
+        try cmd_sweep.run(allocator, io, ".", home_dir, args[2..]);
     } else if (std.mem.eql(u8, command, "audit")) {
         try cmd_audit.run(allocator, io, ".", home_dir);
-    } else if (std.mem.eql(u8, command, "workspace")) {
-        try cmd_workspace.run(allocator, io, home_dir, args);
+    } else if (std.mem.eql(u8, command, "status")) {
+        try cmd_status.run(allocator, io, ".", home_dir, args[2..]);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
         printUsage();
@@ -53,7 +82,8 @@ fn printUsage() void {
         \\Usage: luke <command> [args]
         \\
         \\Commands:
-        \\  init [path]           Crawl workspace and build the AST graph
+        \\  workspace init        Create a local .luke workspace boundary
+        \\  index [path]          Crawl workspace and build the AST graph
         \\  review [args]         Create a compact, manifest-backed review plan
         \\  review start [args]   Alias for review; creates a persistent manifest
         \\  review status <id>    Show review manifest progress
@@ -63,13 +93,6 @@ fn printUsage() void {
         \\  review finalize <id>  Refuse completion while chunks remain
         \\  query <target>        Query the graph for a node or file
         \\  audit                 Structural whole-project audit (requires init)
-        \\  workspace <sub>       Manage workspaces (create/add/remove/delete/list)
-        \\
-        \\Workspace Examples:
-        \\  luke workspace create "Hako Dropship"
-        \\  luke workspace add hako-dropship . backend
-        \\  luke workspace add hako-dropship /path/to/fe frontend
-        \\  luke workspace list
         \\
     , .{});
 }

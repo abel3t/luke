@@ -56,7 +56,7 @@ pub const AstEngine = struct {
     }
 
     pub fn extractKnowledge(self: *AstEngine, absolute_workspace_path: []const u8, entry_path: []const u8, entry_basename: []const u8, knowledge_graph: *graph.Graph) !void {
-        const is_tsx = std.mem.endsWith(u8, entry_basename, ".tsx");
+        const is_tsx = std.mem.endsWith(u8, entry_basename, ".tsx") or std.mem.endsWith(u8, entry_basename, ".jsx");
         const is_go = std.mem.endsWith(u8, entry_basename, ".go");
         
         const lang = if (is_go) self.go_language else if (is_tsx) self.tsx_language else self.ts_language;
@@ -86,6 +86,8 @@ pub const AstEngine = struct {
             var def_node: ?c.TSNode = null;
             var name_node: ?c.TSNode = null;
             var def_capture_name: []const u8 = "";
+            var import_path: ?[]const u8 = null;
+            var call_name: ?[]const u8 = null;
 
             for (match.captures[0..match.capture_count]) |capture| {
                 var capture_len: u32 = 0;
@@ -98,6 +100,40 @@ pub const AstEngine = struct {
                 } else if (std.mem.endsWith(u8, capture_name, ".name")) {
                     name_node = capture.node;
                 }
+                
+                if (std.mem.eql(u8, capture_name, "import.path")) {
+                    const start = c.ts_node_start_byte(capture.node);
+                    const end = c.ts_node_end_byte(capture.node);
+                    if (start < end and end <= content.len) {
+                        import_path = content[start..end];
+                    }
+                }
+                
+                if (std.mem.eql(u8, capture_name, "call.name")) {
+                    const start = c.ts_node_start_byte(capture.node);
+                    const end = c.ts_node_end_byte(capture.node);
+                    if (start < end and end <= content.len) {
+                        call_name = content[start..end];
+                    }
+                }
+            }
+
+            if (import_path) |path| {
+                if (path.len > 0 and path.len < 150) {
+                    const target_id = try std.fmt.allocPrint(self.allocator, "import://{s}", .{path});
+                    try knowledge_graph.addEdge(file_id, target_id, .Imports);
+                    self.allocator.free(target_id);
+                }
+                continue;
+            }
+            
+            if (call_name) |c_name| {
+                if (c_name.len > 0 and c_name.len < 150) {
+                    const target_id = try std.fmt.allocPrint(self.allocator, "call://{s}", .{c_name});
+                    try knowledge_graph.addEdge(file_id, target_id, .Calls);
+                    self.allocator.free(target_id);
+                }
+                continue;
             }
 
             const d_node = def_node orelse continue;
@@ -118,7 +154,7 @@ pub const AstEngine = struct {
 
             const node_id = try std.fmt.allocPrint(self.allocator, "node://{s}/{s}", .{ entry_path, node_name });
             try knowledge_graph.addNode(node_id, n_type, node_name, entry_path, start_point.row + 1, end_point.row + 1);
-            try knowledge_graph.addEdge(node_id, file_id, .Defines);
+            try knowledge_graph.addEdge(file_id, node_id, .Contains);
             self.allocator.free(node_id);
         }
         self.allocator.free(file_id);

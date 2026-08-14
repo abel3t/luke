@@ -2,6 +2,13 @@
 (import_statement
   source: (string (string_fragment) @import.path)) @import
 
+; Calls
+(call_expression
+  function: [
+    (identifier) @call.name
+    (member_expression property: (property_identifier) @call.name)
+  ]) @call
+
 ; Classes
 (class_declaration
   name: (type_identifier) @class.name) @definition.class

@@ -10,7 +10,9 @@ pub const NodeType = enum {
 pub const RelationType = enum {
     Imports,
     Calls,
-    Defines,
+    Contains,
+    Extends,
+    Injects,
 };
 
 pub const Node = struct {
@@ -185,7 +187,9 @@ pub const Graph = struct {
                     const val = line[13..line.len - 1];
                     if (std.mem.eql(u8, val, "Imports")) current_relation = .Imports;
                     if (std.mem.eql(u8, val, "Calls")) current_relation = .Calls;
-                    if (std.mem.eql(u8, val, "Defines")) current_relation = .Defines;
+                    if (std.mem.eql(u8, val, "Contains") or std.mem.eql(u8, val, "Defines")) current_relation = .Contains;
+                    if (std.mem.eql(u8, val, "Extends")) current_relation = .Extends;
+                    if (std.mem.eql(u8, val, "Injects")) current_relation = .Injects;
                 }
             }
         }
@@ -232,5 +236,47 @@ pub const Graph = struct {
                 }
             }
         }
+    }
+
+    pub fn queryTree(self: *Graph, target: []const u8) !void {
+        std.debug.print("Tree navigation for {s}:\n", .{target});
+        var found = false;
+        for (self.nodes.items) |node| {
+            if (std.mem.indexOf(u8, node.id, target) != null) {
+                found = true;
+                std.debug.print("\n[NODE] {s}\n", .{node.id});
+                for (self.edges.items) |edge| {
+                    if (std.mem.eql(u8, edge.source_id, node.id)) {
+                        if (edge.relation == .Contains) std.debug.print("  [CONTAINS] -> {s}\n", .{edge.target_id});
+                        if (edge.relation == .Imports) std.debug.print("  [IMPORTS]  -> {s}\n", .{edge.target_id});
+                        if (edge.relation == .Calls) std.debug.print("  [CALLS]    -> {s}\n", .{edge.target_id});
+                    }
+                }
+            }
+        }
+        if (!found) std.debug.print("No nodes found matching {s}\n", .{target});
+    }
+
+    pub fn queryImpact(self: *Graph, target: []const u8) !void {
+        std.debug.print("Blast radius (impact) for {s}:\n", .{target});
+        var count: usize = 0;
+        for (self.edges.items) |edge| {
+            if (std.mem.indexOf(u8, edge.target_id, target) != null) {
+                if (edge.relation == .Calls) {
+                    std.debug.print("  [CALLED BY] {s} -> {s}\n", .{edge.source_id, edge.target_id});
+                    count += 1;
+                } else if (edge.relation == .Imports) {
+                    std.debug.print("  [IMPORTED BY] {s} -> {s}\n", .{edge.source_id, edge.target_id});
+                    count += 1;
+                }
+            }
+        }
+        if (count == 0) std.debug.print("No dependents found.\n", .{});
+    }
+
+    pub fn queryTrace(self: *Graph, source_id: []const u8, target_id: []const u8) !void {
+        _ = self;
+        std.debug.print("Tracing from {s} to {s}:\n", .{source_id, target_id});
+        std.debug.print("  (Graph trace traversal not fully implemented yet)\n", .{});
     }
 };

@@ -1,8 +1,12 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { join, resolve as resolvePath, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const agentsDir = resolvePath(__dirname, "..", "agents");
 
 const execFileAsync = promisify(execFile);
 const MAX_CONCURRENCY = 2;
@@ -50,13 +54,11 @@ function findAssistantText(messages) {
 	return "";
 }
 
-function workerPrompt(chunk) {
-	return `Review exactly this assigned change unit. Your cwd is the PR-head worktree. Read relevant code and diff context, but do not modify files or run destructive commands.\n\nAssigned unit:\n${JSON.stringify(chunk, null, 2)}\n\nReturn JSON only in this schema:\n{"acknowledged_ranges":[{"start":number,"end":number}],"findings":[{"line":number,"severity":"error|warning|info","mechanism":"concrete failure mechanism","fix":"concrete fix"}]}\n\nAcknowledge every assigned range verbatim. Findings must be on an assigned changed line. Use an empty findings array when clean.`;
+function workerPrompt(chunk, rolePrompt, astContext = "") {
+	return `${rolePrompt}\n\nReview exactly this assigned change unit. Your cwd is the PR-head worktree. Read relevant code and diff context, but do not modify files or run destructive commands.\n\nAssigned unit:\n${JSON.stringify(chunk, null, 2)}${astContext}\n\nReturn JSON only in this schema:\n{"acknowledged_ranges":[{"start":number,"end":number}],"findings":[{"line":number,"severity":"error|warning|info","mechanism":"concrete failure mechanism","fix":"concrete fix"}]}\n\nAcknowledge every assigned range verbatim. Findings must be on an assigned changed line. Use an empty findings array when clean.`;
 }
 
-async function reviewChunk(cwd, chunk, signal) {
-	// A separate Pi process gives each unit an isolated context and avoids relying
-	// on SDK module resolution from a package-installed extension.
+async function spawnWorker(cwd, chunk, rolePrompt, astContext, signal) {
 	return new Promise((resolvePromise, reject) => {
 		const child = spawn(
 			"pi",
@@ -66,8 +68,8 @@ async function reviewChunk(cwd, chunk, signal) {
 				"-p",
 				"--no-session",
 				"--tools",
-				"read,bash,grep,find,ls",
-				workerPrompt(chunk),
+				"read",
+				workerPrompt(chunk, rolePrompt, astContext),
 			],
 			{ cwd, stdio: ["ignore", "pipe", "pipe"] },
 		);
@@ -102,6 +104,53 @@ async function reviewChunk(cwd, chunk, signal) {
 			}
 		});
 	});
+}
+
+async function reviewChunk(cwd, chunk, signal, lukeBin) {
+	let astContext = "";
+	if (lukeBin && chunk.file) {
+		try {
+			const res = await command(lukeBin, ["query", chunk.file], cwd);
+			if (res.stdout.trim()) {
+				astContext = `\n\nAST Knowledge Graph for ${chunk.file}:\n${res.stdout.trim()}`;
+			}
+		} catch (e) {
+			// ignore
+		}
+	}
+
+	let selectedHunters = chunk.review_lenses || [];
+	if (selectedHunters.length === 0) {
+		selectedHunters = ["bloat-hunter", "edge-case-hunter", "security-hunter"];
+	}
+
+	const rolePrompts = await Promise.all(
+		selectedHunters.map(async (hunter) => {
+			try {
+				return await readFile(join(agentsDir, `${hunter}.md`), "utf8");
+			} catch {
+				return `You are the ${hunter}.`;
+			}
+		})
+	);
+
+	const results = await Promise.allSettled(
+		rolePrompts.map((rolePrompt) => spawnWorker(cwd, chunk, rolePrompt, astContext, signal))
+	);
+
+	const findings = [];
+	let acknowledged_ranges = [];
+
+	for (const res of results) {
+		if (res.status === "fulfilled" && res.value) {
+			findings.push(...(res.value.findings || []));
+			if (acknowledged_ranges.length === 0 && res.value.acknowledged_ranges) {
+				acknowledged_ranges = res.value.acknowledged_ranges;
+			}
+		}
+	}
+
+	return { acknowledged_ranges, findings };
 }
 
 async function createPrWorktree(prUrl, cwd) {
@@ -192,7 +241,7 @@ export async function orchestrateReview({
 			let lastError;
 			for (let attempt = 1; attempt <= 2; attempt++) {
 				try {
-					result = await reviewChunk(reviewCwd, item.chunk, signal);
+					result = await reviewChunk(reviewCwd, item.chunk, signal, lukeBin);
 					const resultPath = join(
 						tmpdir(),
 						`luke-result-${started.run_id}-${item.chunk.id}.json`,

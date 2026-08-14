@@ -1,8 +1,7 @@
 const std = @import("std");
 const graph = @import("graph.zig");
 const storage = @import("storage.zig");
-const workspace_mod = @import("workspace.zig");
-const registry = @import("registry.zig");
+
 const cmd_init = @import("cmd_init.zig");
 
 fn commandSucceeded(term: std.process.Child.Term) bool {
@@ -34,12 +33,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     // Detect workspace from CWD
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
-
-    var reg = try registry.Registry.load(allocator, io, home_dir);
-    defer reg.deinit();
-
-    const slug_opt = reg.detect(cwd);
-    var active_slug = slug_opt;
 
     // Collect diff output from all repos
     var diff_output_list = std.ArrayList(u8).empty;
@@ -87,47 +80,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
             try diff_output_list.appendSlice(allocator, result.stdout);
             try diff_output_list.appendSlice(allocator, "\n");
         }
-    } else if (slug_opt != null) {
-        // Workspace mode: run git diff in each registered folder
-        const slug = slug_opt.?;
-        const ws_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces/{s}", .{ home_dir, slug });
-        defer allocator.free(ws_dir);
-
-        if (workspace_mod.Workspace.load(allocator, io, ws_dir)) |loaded_ws| {
-            var ws = loaded_ws;
-            defer ws.deinit();
-
-            try err.interface.print("Workspace: {s} — running review across {d} repos...\n", .{ ws.name, ws.folders.items.len });
-            try err.flush();
-
-            for (ws.folders.items) |folder| {
-                var diff_cmd = std.ArrayList([]const u8).empty;
-                defer diff_cmd.deinit(allocator);
-
-                try diff_cmd.appendSlice(allocator, &[_][]const u8{ "git", "-C", folder.path, "diff" });
-                if (review_args.len > 0) {
-                    try diff_cmd.appendSlice(allocator, review_args);
-                } else {
-                    try diff_cmd.append(allocator, "HEAD");
-                }
-
-                const result = std.process.run(allocator, io, .{ .argv = diff_cmd.items }) catch continue;
-                defer allocator.free(result.stdout);
-                defer allocator.free(result.stderr);
-
-                if (result.stdout.len > 0) {
-                    try err.interface.print("  [{s}] {d} bytes diff\n", .{ folder.name, result.stdout.len });
-                    try err.flush();
-                    try diff_output_list.appendSlice(allocator, result.stdout);
-                    try diff_output_list.appendSlice(allocator, "\n");
-                }
-            }
-        } else |_| {
-            try err.interface.print("Could not load workspace '{s}'. Falling back to single-repo mode.\n", .{slug});
-            try err.flush();
-            active_slug = null;
-            try collectSingleRepoDiff(allocator, io, review_args, &diff_output_list);
-        }
     } else {
         // Single-repo mode
         try collectSingleRepoDiff(allocator, io, review_args, &diff_output_list);
@@ -142,17 +94,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
     }
 
     // Load the knowledge graph
-    const store_slug = active_slug orelse std.fs.path.basename(workspace_path);
-    var store = if (active_slug != null)
-        try storage.Storage.initWithSlug(allocator, io, home_dir, store_slug)
-    else
-        try storage.Storage.init(allocator, io, workspace_path, home_dir);
+    var store = try storage.Storage.init(allocator, io, workspace_path, home_dir);
     defer store.deinit();
 
     var knowledge_graph = graph.Graph.init(allocator);
     defer knowledge_graph.deinit();
 
-    store.loadLongtermMemory(&knowledge_graph) catch {
+    store.loadAst(&knowledge_graph) catch {
         try err.interface.print("No index found. Auto-initializing workspace...\n", .{});
         try err.flush();
         // Re-use cmd_init to build the graph, then retry loading
@@ -161,7 +109,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
             try err.flush();
             return;
         };
-        store.loadLongtermMemory(&knowledge_graph) catch |e2| {
+        store.loadAst(&knowledge_graph) catch |e2| {
             try err.interface.print("Auto-init succeeded but graph still unreadable: {any}\n", .{e2});
             try err.flush();
             return;
@@ -178,7 +126,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8,
 
     // A review is always manifest-backed. Full chunk payloads stay on disk and
     // are exposed only through `review next`, preventing context-sized dumps.
-    const run_id = try saveReviewManifest(allocator, io, home_dir, &chunks);
+    const run_id = try saveReviewManifest(allocator, io, cwd, &chunks);
     defer allocator.free(run_id);
 
     var eligible_lines: u64 = 0;
@@ -304,14 +252,14 @@ fn smallestCoveringNode(knowledge_graph: *graph.Graph, file: []const u8, range: 
     return best;
 }
 
-fn reviewManifestPath(allocator: std.mem.Allocator, home_dir: []const u8, run_id: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.json", .{ home_dir, run_id });
+fn reviewManifestPath(allocator: std.mem.Allocator, cwd: []const u8, run_id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.json", .{ cwd, run_id });
 }
 
 // `mkdir` is atomic: only one CLI process can own a run lock at a time.
 // The owner PID makes crash leftovers recoverable without stealing a live lock.
-fn acquireReviewLock(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) ![]const u8 {
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.lock", .{ home_dir, run_id });
+fn acquireReviewLock(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) ![]const u8 {
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews/{s}.lock", .{ cwd, run_id });
     errdefer allocator.free(lock_path);
     for (0..2) |_| {
         const mkdir_result = try std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", lock_path } });
@@ -359,8 +307,8 @@ fn releaseReviewLock(allocator: std.mem.Allocator, io: std.Io, lock_path: []cons
     allocator.free(result.stderr);
 }
 
-fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, content: []const u8) !void {
-    const path = try reviewManifestPath(allocator, home_dir, run_id);
+fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8, content: []const u8) !void {
+    const path = try reviewManifestPath(allocator, cwd, run_id);
     defer allocator.free(path);
     const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp);
@@ -373,14 +321,14 @@ fn writeManifestAtomic(allocator: std.mem.Allocator, io: std.Io, home_dir: []con
     if (!commandSucceeded(result.term)) return error.ManifestWriteFailed;
 }
 
-fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, chunks: *std.ArrayList(ReviewChunk)) ![]const u8 {
+fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, chunks: *std.ArrayList(ReviewChunk)) ![]const u8 {
     const run_id = try std.fmt.allocPrint(allocator, "review-{d}", .{std.c.getpid()});
     errdefer allocator.free(run_id);
-    const reviews_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews", .{home_dir});
+    const reviews_dir = try std.fmt.allocPrint(allocator, "{s}/.luke/reviews", .{cwd});
     defer allocator.free(reviews_dir);
     _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", reviews_dir } }) catch {};
 
-    const path = try reviewManifestPath(allocator, home_dir, run_id);
+    const path = try reviewManifestPath(allocator, cwd, run_id);
     defer allocator.free(path);
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
@@ -416,16 +364,16 @@ fn saveReviewManifest(allocator: std.mem.Allocator, io: std.Io, home_dir: []cons
     return run_id;
 }
 
-fn readReviewManifest(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) ![]u8 {
-    const path = try reviewManifestPath(allocator, home_dir, run_id);
+fn readReviewManifest(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) ![]u8 {
+    const path = try reviewManifestPath(allocator, cwd, run_id);
     defer allocator.free(path);
     var dir = try std.Io.Dir.openDirAbsolute(io, std.fs.path.dirname(path).?, .{});
     defer dir.close(io);
     return dir.readFileAlloc(io, std.fs.path.basename(path), allocator, .limited(1024 * 1024));
 }
 
-fn reviewStatus(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) !void {
-    const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
+fn reviewStatus(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) !void {
+    const content = readReviewManifest(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
@@ -437,14 +385,14 @@ fn reviewStatus(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, 
     std.debug.print("Review {s}: {d} complete, {d} pending, {d} claimed, {d} blocked\n", .{ run_id, complete, pending, claimed, blocked });
 }
 
-fn reviewFinalize(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) !void {
-    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+fn reviewFinalize(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) !void {
+    const lock = acquireReviewLock(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
         return;
     };
     defer allocator.free(lock);
     defer releaseReviewLock(allocator, io, lock);
-    const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
+    const content = readReviewManifest(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
@@ -456,20 +404,20 @@ fn reviewFinalize(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8
         std.debug.print("Review incomplete: {d} pending, {d} claimed, {d} blocked. Run data retained.\n", .{ pending, claimed, blocked });
         return;
     }
-    const path = try reviewManifestPath(allocator, home_dir, run_id);
+    const path = try reviewManifestPath(allocator, cwd, run_id);
     defer allocator.free(path);
     _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "rm", "-f", path } }) catch {};
     std.debug.print("Review complete: all chunks have terminal success status. Cleared run data.\n", .{});
 }
 
-fn reviewNext(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8) !void {
-    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+fn reviewNext(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8) !void {
+    const lock = acquireReviewLock(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
         return;
     };
     defer allocator.free(lock);
     defer releaseReviewLock(allocator, io, lock);
-    const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
+    const content = readReviewManifest(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
@@ -487,7 +435,7 @@ fn reviewNext(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, ru
         if (status != .string or !std.mem.eql(u8, status.string, "pending")) continue;
         const id = chunk.object.get("id") orelse return error.InvalidReviewManifest;
         if (id != .integer) return error.InvalidReviewManifest;
-        try claimChunk(allocator, io, home_dir, run_id, @intCast(id.integer));
+        try claimChunk(allocator, io, cwd, run_id, @intCast(id.integer));
         var stdout_buf: [8192]u8 = undefined;
         var out = std.Io.File.Writer.init(std.Io.File.stdout(), io, &stdout_buf);
         try out.interface.print("{{\"run_id\":", .{});
@@ -501,26 +449,24 @@ fn reviewNext(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, ru
     std.debug.print("No pending chunks for {s}.\n", .{run_id});
 }
 
-fn reviewSubmit(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, chunk_id: []const u8, result_path: []const u8) !void {
-    const index = std.fmt.parseInt(usize, chunk_id, 10) catch {
-        std.debug.print("Chunk id must be a number.\n", .{});
+fn reviewSubmit(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8, chunk_id: []const u8, result_file: []const u8) !void {
+    const result_content = std.Io.Dir.cwd().readFileAlloc(io, result_file, allocator, @enumFromInt(1024 * 1024)) catch {
+        std.debug.print("Cannot read result file: {s}\n", .{result_file});
         return;
     };
-    const result = std.Io.Dir.cwd().readFileAlloc(io, result_path, allocator, @enumFromInt(1024 * 1024)) catch {
-        std.debug.print("Cannot read review result: {s}\n", .{result_path});
-        return;
-    };
-    defer allocator.free(result);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch {
-        std.debug.print("Review result must be valid JSON.\n", .{});
+    defer allocator.free(result_content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result_content, .{}) catch {
+        std.debug.print("Invalid JSON in result file.\n", .{});
         return;
     };
     defer parsed.deinit();
-    if (!isValidSubmission(parsed.value)) {
+
+    if (parsed.value != .object or !parsed.value.object.contains("acknowledged_ranges") or !parsed.value.object.contains("findings")) {
         std.debug.print("Review result requires acknowledged_ranges and findings with line, severity, mechanism, and fix.\n", .{});
         return;
     }
-    const manifest = readReviewManifest(allocator, io, home_dir, run_id) catch {
+    const manifest = readReviewManifest(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
@@ -528,6 +474,7 @@ fn reviewSubmit(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, 
     var manifest_json = std.json.parseFromSlice(std.json.Value, allocator, manifest, .{}) catch return error.InvalidReviewManifest;
     defer manifest_json.deinit();
     const chunks = manifest_json.value.object.get("chunks") orelse return error.InvalidReviewManifest;
+    const index = std.fmt.parseInt(usize, chunk_id, 10) catch return;
     if (chunks != .array or index >= chunks.array.items.len or chunks.array.items[index] != .object) {
         std.debug.print("Chunk {d} not found.\n", .{index});
         return;
@@ -536,7 +483,7 @@ fn reviewSubmit(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, 
         std.debug.print("Submission must acknowledge every assigned range; finding lines must be assigned to this chunk.\n", .{});
         return;
     }
-    try recordSubmission(allocator, io, home_dir, run_id, index, result);
+    try recordSubmission(allocator, io, cwd, run_id, index, result_content);
 }
 
 fn isValidSubmission(value: std.json.Value) bool {
@@ -598,15 +545,15 @@ fn claimChunk(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, ru
     try writeManifestAtomic(allocator, io, home_dir, run_id, next.items);
 }
 
-fn reviewBlock(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, chunk_id: []const u8) !void {
+fn reviewBlock(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8, chunk_id: []const u8) !void {
     const index = std.fmt.parseInt(usize, chunk_id, 10) catch return;
-    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+    const lock = acquireReviewLock(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
         return;
     };
     defer allocator.free(lock);
     defer releaseReviewLock(allocator, io, lock);
-    const content = readReviewManifest(allocator, io, home_dir, run_id) catch return;
+    const content = readReviewManifest(allocator, io, cwd, run_id) catch return;
     defer allocator.free(content);
     const marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"claimed\"", .{index});
     defer allocator.free(marker);
@@ -618,40 +565,37 @@ fn reviewBlock(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, r
     defer allocator.free(blocked);
     try next.appendSlice(allocator, blocked);
     try next.appendSlice(allocator, content[pos + marker.len..]);
-    try writeManifestAtomic(allocator, io, home_dir, run_id, next.items);
+    try writeManifestAtomic(allocator, io, cwd, run_id, next.items);
     std.debug.print("Marked chunk {d} blocked.\n", .{index});
 }
 
-fn recordSubmission(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, run_id: []const u8, index: usize, result: []const u8) !void {
-    const lock = acquireReviewLock(allocator, io, home_dir, run_id) catch {
+fn recordSubmission(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, run_id: []const u8, index: usize, result: []const u8) !void {
+    const lock = acquireReviewLock(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run busy: {s}. Retry.\n", .{run_id});
         return;
     };
     defer allocator.free(lock);
     defer releaseReviewLock(allocator, io, lock);
-    const content = readReviewManifest(allocator, io, home_dir, run_id) catch {
+    const content = readReviewManifest(allocator, io, cwd, run_id) catch {
         std.debug.print("Review run not found: {s}\n", .{run_id});
         return;
     };
     defer allocator.free(content);
 
-    const chunk_marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"claimed\"", .{index});
-    defer allocator.free(chunk_marker);
-    const chunk_pos = std.mem.indexOf(u8, content, chunk_marker) orelse {
-        std.debug.print("Pending chunk {d} not found.\n", .{index});
-        return;
-    };
-    const marker = "\"status\": \"claimed\"";
-    const pos = chunk_pos + std.mem.indexOf(u8, chunk_marker, marker).?;
+    const marker = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"claimed\"", .{index});
+    defer allocator.free(marker);
+    const pos = std.mem.indexOf(u8, content, marker) orelse return;
 
     var next = std.ArrayList(u8).empty;
     defer next.deinit(allocator);
-    try next.appendSlice(allocator, content[0..pos]);
-    try next.appendSlice(allocator, "\"status\": \"complete\", \"result\": ");
-    try next.appendSlice(allocator, result);
-    try next.appendSlice(allocator, content[pos + marker.len ..]);
 
-    try writeManifestAtomic(allocator, io, home_dir, run_id, next.items);
+    try next.appendSlice(allocator, content[0..pos]);
+    const complete = try std.fmt.allocPrint(allocator, "\"id\": {d}, \"status\": \"complete\", \"result\": {s}", .{ index, result });
+    defer allocator.free(complete);
+    try next.appendSlice(allocator, complete);
+    try next.appendSlice(allocator, content[pos + marker.len..]);
+
+    try writeManifestAtomic(allocator, io, cwd, run_id, next.items);
     std.debug.print("Recorded validated evidence for chunk {d}.\n", .{index});
 }
 

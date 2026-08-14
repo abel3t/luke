@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { orchestrateReview } from "./review-runner.js";
+import { orchestrateTask } from "./task-runner.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..");
@@ -109,6 +110,32 @@ async function runAutomatedReview(pi, args, ctx) {
 	}
 }
 
+async function runAutomatedTask(pi, args, ctx) {
+	const target = String(args || "").trim();
+	if (!target) {
+		ctx?.ui?.notify?.(
+			"Provide a task description.",
+			"warning",
+		);
+		return;
+	}
+	try {
+		const result = await orchestrateTask({
+			target,
+			cwd: ctx?.cwd || process.cwd(),
+			onProgress: (message) => ctx?.ui?.notify?.(`Luke Task: ${message}`, "info"),
+		});
+		const report = `Luke task complete.\n\n${result.output}`;
+		ctx?.ui?.notify?.("Task completed", "info");
+		pi.sendUserMessage(report, { deliverAs: "followUp" });
+		return report;
+	} catch (error) {
+		const message = `Luke task failed: ${error instanceof Error ? error.message : String(error)}`;
+		ctx?.ui?.notify?.(message, "error");
+		throw new Error(message);
+	}
+}
+
 function sendSkill(pi, skillName, args, ctx) {
 	const suffix = String(args || "").trim();
 	const message = suffix
@@ -124,12 +151,51 @@ function sendSkill(pi, skillName, args, ctx) {
 	pi.sendUserMessage(message);
 }
 
-export default function lukeExtension(pi) {
+
+export default function (pi) {
+	// Lifecycle events
+	pi.on("session_start", async (_event, ctx) => {
+		ctx.ui?.notify?.("LUKE Extension activated", "info");
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		const isBash = event.toolName === "bash" || event.toolName === "run_command";
+		if (isBash) {
+			const cmd = event.input?.command || event.input?.CommandLine || "";
+			if (cmd.includes("luke task create")) {
+				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", "AI is attempting to create a task via bash. Allow?");
+				if (!ok) {
+					return { block: true, reason: "Blocked by user. Do NOT create tasks without approval." };
+				}
+			}
+			if (cmd.includes("luke task approve")) {
+				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", "AI is attempting to APPROVE a task via bash. Allow?");
+				if (!ok) {
+					return { block: true, reason: "Blocked by user. Task approval aborted." };
+				}
+			}
+		}
+		
+		if (event.toolName === "invoke_subagent") {
+			const ok = await ctx?.ui?.confirm?.("LUKE Delegation", "LUKE is spawning a subagent. Did you already approve the SPEC.md plan?");
+			if (!ok) {
+				return { block: true, reason: "Blocked by user. You MUST get the plan approved via ask_question before spawning subagents." };
+			}
+		}
+
+		const isEditTool = event.toolName === "write_to_file" || event.toolName === "replace_file_content" || event.toolName === "edit_file";
+		if (isEditTool) {
+			const targetPath = event.input?.TargetFile || event.input?.path || "";
+			if (targetPath && !targetPath.includes(".luke/tasks/")) {
+				return { block: true, reason: "FATAL: Code edits outside of a Task Worktree are strictly forbidden by LUKE Engine. You MUST use luke_task_engine to create a task first." };
+			}
+		}
+	});
 	injectLukePath();
 
 	pi.registerCommand("luke", {
 		description:
-			"Luke commands: help, load, index, query <target>, audit, review [range|--pr ...], commit",
+			"Luke commands: help, load, index, query <target>, audit, review [range|--pr ...], task <desc>, commit",
 		handler: async (args, ctx) => {
 			const [command, ...rest] = splitArgs(args);
 			const forwarded = rest.join(" ");
@@ -149,11 +215,12 @@ export default function lukeExtension(pi) {
 				return;
 			}
 			if (command === "review") return runAutomatedReview(pi, forwarded, ctx);
+			if (command === "task") return runAutomatedTask(pi, forwarded, ctx);
 			if (command === "commit")
 				return sendSkill(pi, "luke-commit", forwarded, ctx);
 
 			ctx?.ui?.notify?.(
-				"Unknown Luke command. Use /luke help, /luke load, /luke index, /luke query <target>, /luke audit, /luke review, or /luke commit.",
+				"Unknown Luke command. Use /luke help, /luke load, /luke index, /luke query <target>, /luke audit, /luke review, /luke task <desc>, or /luke commit.",
 				"warning",
 			);
 		},
@@ -165,17 +232,22 @@ export default function lukeExtension(pi) {
 		["luke-index", "luke-index"],
 		["luke-query", "luke-query"],
 		["luke-review", "luke-review"],
+		["luke-task", "luke-task"],
 		["luke-commit", "luke-commit"],
 	]) {
 		pi.registerCommand(name, {
 			description:
 				name === "luke-review"
 					? "Run automated manifest-backed Luke review"
-					: `Run /skill:${skill}`,
+					: name === "luke-task"
+						? "Run automated Luke task with GSD process"
+						: `Run /skill:${skill}`,
 			handler: (args, ctx) =>
 				name === "luke-review"
 					? runAutomatedReview(pi, args, ctx)
-					: sendSkill(pi, skill, args, ctx),
+					: name === "luke-task"
+						? runAutomatedTask(pi, args, ctx)
+						: sendSkill(pi, skill, args, ctx),
 		});
 	}
 
@@ -211,6 +283,53 @@ export default function lukeExtension(pi) {
 						text: output || `luke exited with code ${result.exitCode}`,
 					},
 				],
+				details: result,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "luke_task_engine",
+		label: "LUKE Task Engine",
+		description: "Interface to the LUKE Zig Task Engine for managing task lifecycles (Git Worktrees). Use subcommand 'create' to start a new task. The extension will automatically prompt the user for confirmation.",
+		promptGuidelines: [
+			"Never create tasks implicitly.",
+			"When creating a task, use subcommand='create'. For other lifecycle events, use claim, submit, approve, reject, or cancel.",
+		],
+		parameters: Type.Object({
+			subcommand: Type.Union([
+				Type.Literal("create"),
+				Type.Literal("claim"),
+				Type.Literal("submit"),
+				Type.Literal("approve"),
+				Type.Literal("reject"),
+				Type.Literal("cancel"),
+			], { description: "The task lifecycle event to trigger." }),
+			taskId: Type.String({ description: "The unique Task ID (e.g., T-01)." }),
+			specPath: Type.Optional(Type.String({ description: "Path to the SPEC.md file. Only used for 'create'." })),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (params.subcommand === "create") {
+				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", `AI is requesting to physically create the Git Worktree for task ${params.taskId}. Allow?`);
+				if (!ok) {
+					return { content: [{ type: "text", text: "Task creation aborted by user." }] };
+				}
+			}
+			if (params.subcommand === "approve") {
+				const ok = await ctx?.ui?.confirm?.("LUKE Task Engine", `Are you sure you want to APPROVE task ${params.taskId}? This will merge the code and garbage collect the worktree.`);
+				if (!ok) {
+					return { content: [{ type: "text", text: "Task approval aborted by user." }] };
+				}
+			}
+			const args = ["task", params.subcommand, params.taskId];
+			if (params.subcommand === "create" && params.specPath) {
+				args.push("--spec", params.specPath);
+			}
+			const cwd = ctx?.cwd || process.cwd();
+			const result = await runLuke(args, cwd, signal);
+			const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+			return {
+				content: [{ type: "text", text: output || `luke exited with code ${result.exitCode}` }],
 				details: result,
 			};
 		},

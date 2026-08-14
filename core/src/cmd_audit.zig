@@ -6,16 +6,13 @@ const storage = @import("storage.zig");
 /// runtime reachability: the current graph has symbol ranges but no reliable use
 /// edges yet, so dead-code assertions would be dishonest.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8) !void {
-    var stderr_buf: [512]u8 = undefined;
-    var err = std.Io.File.Writer.init(std.Io.File.stderr(), io, &stderr_buf);
     var store = try storage.Storage.init(allocator, io, workspace_path, home_dir);
     defer store.deinit();
 
     var knowledge_graph = graph.Graph.init(allocator);
     defer knowledge_graph.deinit();
-    store.loadLongtermMemory(&knowledge_graph) catch {
-        try err.interface.print("No index found. Run `luke init .` before `luke audit`.\n", .{});
-        try err.flush();
+    store.loadAst(&knowledge_graph) catch {
+        std.debug.print("Audit failed: workspace not indexed. Run `luke index` first.\n", .{});
         return;
     };
 

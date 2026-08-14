@@ -6,15 +6,8 @@ pub const Storage = struct {
     io: std.Io,
     luke_path: []const u8,
 
-    /// Use this when you know the workspace slug (workspace mode).
-    pub fn initWithSlug(allocator: std.mem.Allocator, io: std.Io, home_dir: []const u8, slug: []const u8) !Storage {
-        const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke/workspaces/{s}", .{ home_dir, slug });
-        _ = std.process.run(allocator, io, .{ .argv = &[_][]const u8{ "mkdir", "-p", luke_path } }) catch {};
-        return .{ .allocator = allocator, .io = io, .luke_path = luke_path };
-    }
-
-    /// Fallback: single-folder mode — derives slug from workspace basename.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, workspace_path: []const u8, home_dir: []const u8) !Storage {
+        _ = home_dir; // not used anymore, storage is strictly local
         const is_absolute = std.fs.path.isAbsolute(workspace_path);
         const absolute_workspace_path = if (is_absolute)
             try allocator.dupe(u8, workspace_path)
@@ -28,19 +21,31 @@ pub const Storage = struct {
         };
         defer allocator.free(absolute_workspace_path);
 
-        const workspace_name = std.fs.path.basename(absolute_workspace_path);
-        return initWithSlug(allocator, io, home_dir, workspace_name);
+        const luke_path = try std.fmt.allocPrint(allocator, "{s}/.luke", .{absolute_workspace_path});
+        
+        // Ensure .luke exists. If not, this is not a registered workspace.
+        var check_dir = std.Io.Dir.openDirAbsolute(io, luke_path, .{}) catch {
+            return error.NotARegisteredWorkspace;
+        };
+        check_dir.close(io);
+
+        return .{ .allocator = allocator, .io = io, .luke_path = luke_path };
     }
 
     pub fn deinit(self: *Storage) void {
         self.allocator.free(self.luke_path);
     }
 
-    pub fn saveLongTermMemory(self: *Storage, knowledge_graph: *graph.Graph) !void {
-        const longterm_path = try std.fmt.allocPrint(self.allocator, "{s}/longterm.zon", .{self.luke_path});
-        defer self.allocator.free(longterm_path);
+    pub fn saveAst(self: *Storage, knowledge_graph: *graph.Graph) !void {
+        // Create longterm folder for future semantic memories
+        const longterm_dir = try std.fmt.allocPrint(self.allocator, "{s}/longterm", .{self.luke_path});
+        defer self.allocator.free(longterm_dir);
+        _ = std.process.run(self.allocator, self.io, .{ .argv = &[_][]const u8{ "mkdir", "-p", longterm_dir } }) catch {};
 
-        var file = try std.Io.Dir.createFileAbsolute(self.io, longterm_path, .{});
+        const ast_path = try std.fmt.allocPrint(self.allocator, "{s}/ast.zon", .{self.luke_path});
+        defer self.allocator.free(ast_path);
+
+        var file = try std.Io.Dir.createFileAbsolute(self.io, ast_path, .{});
         defer file.close(self.io);
 
         var write_buf: [4096]u8 = undefined;
@@ -48,18 +53,18 @@ pub const Storage = struct {
         try knowledge_graph.writeZon(&writer.interface);
         try writer.flush();
 
-        std.debug.print("Long-term memory successfully saved to: {s}\n", .{longterm_path});
+        std.debug.print("AST Knowledge Graph successfully saved to: {s}\n", .{ast_path});
     }
 
-    pub fn loadLongtermMemory(self: *Storage, knowledge_graph: *graph.Graph) !void {
+    pub fn loadAst(self: *Storage, knowledge_graph: *graph.Graph) !void {
         var dir = std.Io.Dir.openDirAbsolute(self.io, self.luke_path, .{}) catch {
-            std.debug.print("No knowledge graph found. Run `luke init` first.\n", .{});
+            std.debug.print("No workspace found. Run `luke workspace init` and `luke index` first.\n", .{});
             return error.NoDatabaseFound;
         };
         defer dir.close(self.io);
 
         const limit = @as(std.Io.Limit, @enumFromInt(1024 * 1024 * 50)); // 50MB
-        const content = dir.readFileAlloc(self.io, "longterm.zon", self.allocator, limit) catch {
+        const content = dir.readFileAlloc(self.io, "ast.zon", self.allocator, limit) catch {
             std.debug.print("No database found. Run `luke init` first.\n", .{});
             return error.NoDatabaseFound;
         };

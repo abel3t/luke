@@ -8,6 +8,7 @@ description: Load Luke usage guidance into context so the agent remembers when t
 Luke is available in this session.
 
 Use Luke when:
+- orienting yourself in a new session or checking active tasks: `luke status`
 - indexing or re-indexing the detected multi-repo workspace: `luke init .`
 - understanding dependencies or blast radius: `luke query <target>`
 - reviewing local changes or explicit PRs: `luke review ...`

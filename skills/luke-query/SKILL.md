@@ -10,27 +10,38 @@ You have access to a powerful internal AST knowledge graph built using the `luke
 Whenever you are asked to analyze code, understand dependencies, or determine the "blast radius" of a potential refactor, you MUST use `luke` to query the knowledge graph instead of just trying to grep through the codebase blindly.
 
 ## Setup
-If the knowledge graph is not built yet (or is out of date), you must first initialize it:
+If the knowledge graph is not built yet (or is out of date), you must first initialize it in the current repository:
 ```bash
-luke init .
+luke workspace init .
+luke index .
 ```
-This command parses all `.ts`, `.tsx`, and `.go` files in the workspace and builds a fast, local `.zon` knowledge graph in `~/.luke/<workspace>/longterm.zon`.
+This command parses all `.ts`, `.tsx`, `.js`, `.jsx` and `.go` files in the workspace and builds a fast, local `.zon` knowledge graph in `<repo>/.luke/ast.zon`.
 
 ## Usage
-To search the graph for a specific file, class, struct, or function name, run:
+The engine operates on a tree-based, vectorless structural graph. You can query the hierarchy (Tree) or the blast radius (Impact).
+
+### 1. View Structure & Dependencies
+To see what a file or function contains, calls, and imports, use the `tree` command:
 ```bash
-luke query <target_name>
+luke query tree <target_name>
 ```
 
-For example, to find all references to `WorkspaceWalker`:
+Example:
 ```bash
-luke query WorkspaceWalker
+luke query tree my-file.ts
+```
+Output shows `[CONTAINS]`, `[CALLS]`, and `[IMPORTS]` edges going OUT of the target node.
+
+### 2. Determine Blast Radius
+To see who depends on a specific file or function (who calls it or imports it), use the `impact` command:
+```bash
+luke query impact <target_name>
 ```
 
-### Understanding the Output
-The output will show:
-- `[NODE]`: The specific symbol (Function, Class, Struct, File) you queried and where it lives.
-- `[USES]`: The dependencies that this node relies on (e.g. what it imports or calls).
-- `[USED_BY]`: The dependents that rely on this node (e.g. who imports or calls it).
+Example:
+```bash
+luke query impact doThing
+```
+Output shows `[CALLED BY]` and `[IMPORTED BY]` edges coming INTO the target node.
 
 Use this structural information to inform your analysis or code modifications with perfect accuracy.

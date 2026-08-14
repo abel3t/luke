@@ -1,26 +1,26 @@
 ---
 name: luke-index
-description: Rebuild the Luke AST knowledge graph for the detected multi-repo workspace.
+description: Rebuild the Luke AST knowledge graph for the local workspace.
 ---
 
 # Luke Index
 
-Rebuild the Luke AST knowledge graph for the detected workspace.
+Rebuild the Luke AST knowledge graph for the current workspace.
 
 ## Usage
 
-Run from any repo registered in the workspace:
+Run from the root of your repository:
 
 ```bash
-luke init .
+luke workspace init .
+luke index .
 ```
 
-Luke detects the workspace from the current directory and indexes all folders registered in that workspace.
+Luke operates purely on a local-first principle. One `.luke` directory per repository. It does not use any global registry anymore.
 
 ## Rules
 
 - Use this when the user asks to index, re-index, rescan, refresh Luke, or rebuild the knowledge graph.
-- Re-index is workspace-scoped, not single-repo scoped.
-- Do not pass a guessed workspace name as a path.
-- If Luke cannot detect a workspace, stop and ask the user to create/add the workspace first.
+- Indexing is completely local to the `.luke` boundary.
+- If `.luke` is missing, you must run `luke workspace init .` before indexing.
 - Keep output short: report parsed file count and saved index path if available.
